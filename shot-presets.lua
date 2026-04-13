@@ -286,7 +286,7 @@ function script_properties()
 		return true
 	end)
 
-	obs.obs_properties_add_separator(props)
+	-- visual gap
 
 	-- Per-preset controls
 	for i = 1, num_presets do
@@ -325,7 +325,7 @@ function script_properties()
 				return false
 			end)
 
-		obs.obs_properties_add_separator(props)
+		-- visual gap
 	end
 
 	return props

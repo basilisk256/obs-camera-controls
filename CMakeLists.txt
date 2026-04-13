@@ -1,31 +1,42 @@
-cmake_minimum_required(VERSION 3.16)
-project(obs-shot-presets VERSION 1.0.0 LANGUAGES C)
-
-# --- Find OBS ---
-# Set OBS_SOURCE_DIR to your OBS Studio source tree if not building in-tree
-if(NOT TARGET OBS::libobs)
-  find_package(libobs REQUIRED)
-endif()
-
-# --- Plugin shared library ---
-add_library(obs-shot-presets MODULE
-  src/plugin-main.c
-  src/shot-presets-filter.c
-  src/easing.c
-)
-
-target_include_directories(obs-shot-presets PRIVATE src)
-
-target_link_libraries(obs-shot-presets PRIVATE OBS::libobs)
-
-# Install into OBS plugin directory
-if(WIN32)
-  set(OBS_PLUGIN_DIR "$ENV{APPDATA}/obs-studio/plugins/obs-shot-presets/bin/64bit")
-  set(OBS_DATA_DIR "$ENV{APPDATA}/obs-studio/plugins/obs-shot-presets/data")
+# --- Detect if the plugin is build out of tree or not ---
+if(CMAKE_PROJECT_NAME STREQUAL "obs-studio")
+  set(BUILD_OUT_OF_TREE OFF)
 else()
-  set(OBS_PLUGIN_DIR "$ENV{HOME}/.config/obs-studio/plugins/obs-shot-presets/bin/64bit")
-  set(OBS_DATA_DIR "$ENV{HOME}/.config/obs-studio/plugins/obs-shot-presets/data")
+  set(BUILD_OUT_OF_TREE ON)
+  cmake_minimum_required(VERSION 3.16...3.26)
+endif()
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/common/bootstrap.cmake" NO_POLICY_SCOPE)
+
+project(${_name} VERSION ${_version})
+
+include(compilerconfig)
+include(defaults)
+include(helpers)
+
+add_library(${PROJECT_NAME} MODULE)
+
+target_link_libraries(${PROJECT_NAME} PRIVATE OBS::libobs)
+
+if(BUILD_OUT_OF_TREE)
+  find_package(libobs REQUIRED)
+  find_package(obs-frontend-api REQUIRED)
+  target_link_libraries(${PROJECT_NAME} PRIVATE OBS::obs-frontend-api)
+else()
+  target_link_libraries(${PROJECT_NAME} PRIVATE OBS::frontend-api)
 endif()
 
-install(TARGETS obs-shot-presets DESTINATION "${OBS_PLUGIN_DIR}")
-install(DIRECTORY data/ DESTINATION "${OBS_DATA_DIR}")
+set_target_properties(${PROJECT_NAME} PROPERTIES MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+
+configure_file(${CMAKE_CURRENT_SOURCE_DIR}/version.h.in ${CMAKE_CURRENT_SOURCE_DIR}/version.h)
+
+target_sources(${PROJECT_NAME} PRIVATE
+  shot-presets-filter.c
+  easing.c
+  easing.h
+  version.h)
+
+if(BUILD_OUT_OF_TREE)
+  set_target_properties_plugin(${CMAKE_PROJECT_NAME} PROPERTIES OUTPUT_NAME ${_name})
+else()
+  set_target_properties_obs(${PROJECT_NAME} PROPERTIES FOLDER "plugins/shot-presets" PREFIX "")
+endif()

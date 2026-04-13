@@ -5,8 +5,6 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-/* --- Individual easing functions --- */
-
 static float linear(float t) { return t; }
 
 static float quad_in(float t) { return t * t; }
@@ -97,29 +95,26 @@ static float back_inout(float t) {
 	return 0.5f * (f * f * (3.59491f * f + 2.59491f) + 2.0f);
 }
 
-/* --- Dispatch --- */
-
 typedef float (*ease_fn)(float);
 
 static const ease_fn ease_table[][3] = {
-	/* LINEAR      */ { linear,      linear,       linear },
-	/* QUADRATIC   */ { quad_in,     quad_out,     quad_inout },
-	/* CUBIC       */ { cubic_in,    cubic_out,    cubic_inout },
-	/* QUARTIC     */ { quart_in,    quart_out,    quart_inout },
-	/* QUINTIC     */ { quint_in,    quint_out,    quint_inout },
-	/* SINE        */ { sine_in,     sine_out,     sine_inout },
-	/* CIRCULAR    */ { circ_in,     circ_out,     circ_inout },
-	/* EXPONENTIAL */ { expo_in,     expo_out,     expo_inout },
-	/* ELASTIC     */ { elastic_in,  elastic_out,  elastic_inout },
-	/* BOUNCE      */ { bounce_in,   bounce_out,   bounce_inout },
-	/* BACK        */ { back_in,     back_out,     back_inout },
+	{ linear,      linear,       linear },
+	{ quad_in,     quad_out,     quad_inout },
+	{ cubic_in,    cubic_out,    cubic_inout },
+	{ quart_in,    quart_out,    quart_inout },
+	{ quint_in,    quint_out,    quint_inout },
+	{ sine_in,     sine_out,     sine_inout },
+	{ circ_in,     circ_out,     circ_inout },
+	{ expo_in,     expo_out,     expo_inout },
+	{ elastic_in,  elastic_out,  elastic_inout },
+	{ bounce_in,   bounce_out,   bounce_inout },
+	{ back_in,     back_out,     back_inout },
 };
 
 float get_eased(float t, int easing_type, int easing_function)
 {
 	if (easing_type == EASE_NONE || easing_function == EASING_LINEAR)
 		return t;
-
 	if (easing_function < 0 || easing_function > EASING_BACK)
 		return t;
 
@@ -130,6 +125,5 @@ float get_eased(float t, int easing_type, int easing_function)
 	case EASE_IN_OUT: col = 2; break;
 	default:          return t;
 	}
-
 	return ease_table[easing_function][col](t);
 }

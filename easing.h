@@ -1,12 +1,10 @@
 #pragma once
 
-/* Easing types */
 #define EASE_NONE    0
 #define EASE_IN      1
 #define EASE_OUT     2
 #define EASE_IN_OUT  3
 
-/* Easing functions */
 #define EASING_LINEAR      0
 #define EASING_QUADRATIC   1
 #define EASING_CUBIC       2
