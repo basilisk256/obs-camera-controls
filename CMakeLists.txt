@@ -7,7 +7,7 @@ else()
 endif()
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/common/bootstrap.cmake" NO_POLICY_SCOPE)
 
-project(${_name} VERSION ${_version})
+project(${_name} VERSION ${_version} LANGUAGES C CXX)
 
 include(compilerconfig)
 include(defaults)
@@ -20,17 +20,23 @@ target_link_libraries(${PROJECT_NAME} PRIVATE OBS::libobs)
 if(BUILD_OUT_OF_TREE)
   find_package(libobs REQUIRED)
   find_package(obs-frontend-api REQUIRED)
-  target_link_libraries(${PROJECT_NAME} PRIVATE OBS::obs-frontend-api)
+  find_package(Qt6 REQUIRED COMPONENTS Widgets)
+  target_link_libraries(${PROJECT_NAME} PRIVATE OBS::obs-frontend-api Qt6::Widgets)
 else()
-  target_link_libraries(${PROJECT_NAME} PRIVATE OBS::frontend-api)
+  find_package(Qt6 REQUIRED COMPONENTS Widgets)
+  target_link_libraries(${PROJECT_NAME} PRIVATE OBS::frontend-api Qt6::Widgets)
 endif()
 
-set_target_properties(${PROJECT_NAME} PROPERTIES MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+set_target_properties(${PROJECT_NAME} PROPERTIES
+  MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
+  AUTOMOC ON)
 
 configure_file(${CMAKE_CURRENT_SOURCE_DIR}/version.h.in ${CMAKE_CURRENT_SOURCE_DIR}/version.h)
 
 target_sources(${PROJECT_NAME} PRIVATE
   shot-presets-filter.c
+  shot-presets-dock.cpp
+  shot-presets-dock.hpp
   easing.c
   easing.h
   version.h)

@@ -1,0 +1,87 @@
+#pragma once
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* Called by the dock to trigger a preset on the active filter instance.
+ * The filter registers/unregisters itself so only one instance is active. */
+void shot_presets_go_to(int preset_index);
+
+/* Same as go_to, but applies the target transform instantly (no animation) */
+void shot_presets_cut(int preset_index);
+
+/* Query how many presets the active filter has */
+int shot_presets_get_count(void);
+
+/* Get a preset's name (returns "" if invalid) */
+const char *shot_presets_get_name(int index);
+
+/* Rename a preset */
+void shot_presets_set_name(int index, const char *name);
+
+/* Check if a preset has a saved transform */
+int shot_presets_is_active(int index);
+
+/* Get/set global default duration */
+int shot_presets_get_duration(void);
+void shot_presets_set_duration(int ms);
+
+/* Per-preset duration override (0 = use global default) */
+int shot_presets_get_preset_duration(int index);
+void shot_presets_set_preset_duration(int index, int ms);
+
+/* Read/write per-preset crop (live-applies to source on set) */
+void shot_presets_get_crop(int index, int *l, int *t, int *r, int *b);
+void shot_presets_set_crop(int index, int l, int t, int r, int b);
+
+/* Save current transform into preset */
+void shot_presets_capture(int preset_index);
+
+/* Per-preset transition type */
+typedef enum {
+	SHOT_TRANSITION_MOVE = 0, /* animated transform */
+	SHOT_TRANSITION_CUT  = 1, /* instant */
+} shot_preset_transition_t;
+
+int shot_presets_get_transition(int index);
+void shot_presets_set_transition(int index, int type);
+
+/* Add / remove presets in the active filter */
+void shot_presets_add_preset(const char *name);
+void shot_presets_remove_preset(int index);
+
+/* Is there an active Shot Presets filter on the current scene? */
+int shot_presets_has_active(void);
+
+/* Enumerate scenes whose scene graph contains this filter's parent source.
+ * The callback is invoked once per matching scene name. */
+typedef void (*shot_presets_scene_cb)(const char *scene_name, void *user);
+void shot_presets_for_each_source_scene(shot_presets_scene_cb cb, void *user);
+
+/* Copy the transform of this source as it lives in the named scene into
+ * the given preset slot. */
+void shot_presets_paste_from_scene(int preset_index, const char *scene_name);
+
+/* Full transform struct for dock UI. Mirrors obs-sceneitem fields. */
+typedef struct shot_preset_transform {
+	float pos_x, pos_y;
+	float scale_x, scale_y;
+	float rotation;
+	unsigned int alignment;
+	int bounds_type;
+	float bounds_x, bounds_y;
+	unsigned int bounds_align;
+} shot_preset_transform_t;
+
+/* Read the full transform of a preset. Returns 1 if the preset has a
+ * captured transform, 0 otherwise (fields still populated). */
+int shot_presets_get_transform(int index, shot_preset_transform_t *out);
+
+/* Write the full transform of a preset and live-apply to the sceneitem. */
+void shot_presets_set_transform(int index,
+                                const shot_preset_transform_t *in);
+
+#ifdef __cplusplus
+}
+#endif
