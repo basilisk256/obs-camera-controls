@@ -42,6 +42,8 @@ void shot_presets_capture(int preset_index);
 typedef enum {
 	SHOT_TRANSITION_MOVE = 0, /* animated transform */
 	SHOT_TRANSITION_CUT  = 1, /* instant */
+	SHOT_TRANSITION_FADE = 2, /* cross-fade: opacity 1→0, cut transform,
+	                             opacity 0→1 over full duration */
 } shot_preset_transition_t;
 
 int shot_presets_get_transition(int index);

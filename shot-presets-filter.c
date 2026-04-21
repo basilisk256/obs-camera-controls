@@ -1,5 +1,6 @@
 #include <obs-module.h>
 #include <obs-frontend-api.h>
+#include <graphics/matrix4.h>
 #include <util/dstr.h>
 #include <math.h>
 #include <stdio.h>
@@ -46,6 +47,16 @@ struct shot_preset {
 struct shot_presets_data {
 	obs_source_t *source;
 
+	/* Enabled-scene binding. The filter lives on a shared source (e.g.
+	 * a webcam used in multiple scenes), but shot presets should only
+	 * drive sceneitem transforms in scenes the user explicitly enables.
+	 * Other scenes using the same source keep their own transforms
+	 * untouched. Empty list = unbound → falls back to "any scene with
+	 * this source" so initial setup just works. */
+#define MAX_ENABLED_SCENES 32
+	char enabled_scenes[MAX_ENABLED_SCENES][256];
+	int num_enabled_scenes;
+
 	struct shot_preset presets[MAX_PRESETS];
 	int num_presets;
 	int current_preset;       /* last activated preset index, -1 = none */
@@ -73,7 +84,68 @@ struct shot_presets_data {
 
 	/* Hotkeys */
 	obs_hotkey_id hotkeys[MAX_PRESETS];
+
+	/* Fade (cross-dissolve) transition state.
+	 *
+	 * When a FADE preset is triggered, the filter temporarily becomes
+	 * a canvas-sized compositor: it captures the source pixels into
+	 * fade_source_cap, overrides its reported width/height to the
+	 * canvas dimensions, and overrides the sceneitem transform to
+	 * "identity fill canvas". Each fade frame, filter_render draws
+	 * the captured source twice into the canvas-sized output — once
+	 * with fade_from_mtx at opacity (1-t), once with fade_to_mtx at
+	 * opacity t — giving a true cross-fade between the two framings.
+	 * On finish, the real target transform is restored.
+	 *
+	 * fade_effect is a small alpha-multiply shader used for both
+	 * draws; it has one uniform, `opacity`, that we set per draw. */
+	gs_effect_t *fade_effect;
+	bool fade_enabled;
+	int fade_diag_frames;
+	float fade_t;                /* eased 0→1 progress, for logging */
+	gs_texrender_t *fade_source_cap;  /* source-native-sized capture */
+	struct matrix4 fade_from_mtx;     /* source-quad → canvas (from) */
+	struct matrix4 fade_to_mtx;       /* source-quad → canvas (to)   */
+	uint32_t fade_canvas_w;
+	uint32_t fade_canvas_h;
+	uint32_t fade_src_w;              /* source dims captured at start */
+	uint32_t fade_src_h;
 };
+
+/* Embedded HLSL for the fade effect — avoids shipping a data file. */
+static const char *FADE_EFFECT_HLSL =
+"uniform float4x4 ViewProj;\n"
+"uniform texture2d image;\n"
+"uniform float opacity;\n"
+"\n"
+"sampler_state textureSampler {\n"
+"    Filter   = Linear;\n"
+"    AddressU = Clamp;\n"
+"    AddressV = Clamp;\n"
+"};\n"
+"\n"
+"struct VertData {\n"
+"    float4 pos : POSITION;\n"
+"    float2 uv  : TEXCOORD0;\n"
+"};\n"
+"\n"
+"VertData VSDefault(VertData v_in) {\n"
+"    VertData v_out;\n"
+"    v_out.pos = mul(float4(v_in.pos.xyz, 1.0), ViewProj);\n"
+"    v_out.uv  = v_in.uv;\n"
+"    return v_out;\n"
+"}\n"
+"\n"
+"float4 PSDraw(VertData v_in) : TARGET {\n"
+"    return image.Sample(textureSampler, v_in.uv) * opacity;\n"
+"}\n"
+"\n"
+"technique Draw {\n"
+"    pass {\n"
+"        vertex_shader = VSDefault(v_in);\n"
+"        pixel_shader  = PSDraw(v_in);\n"
+"    }\n"
+"}\n";
 
 /* ── Global instance tracking ──────────────────────────────
  * g_active_instance points at whichever filter should back the dock
@@ -94,6 +166,8 @@ void go_to_preset(struct shot_presets_data *d, int index);
 void cut_to_preset(struct shot_presets_data *d, int index);
 bool capture_transform(struct shot_presets_data *d, struct shot_preset *p);
 void save_presets(struct shot_presets_data *d, obs_data_t *settings);
+static void bind_home_scene_if_needed(struct shot_presets_data *d);
+static bool is_scene_enabled(struct shot_presets_data *d, const char *name);
 static void apply_transform(struct shot_presets_data *d,
                             struct shot_preset *from,
                             struct shot_preset *to, float t);
@@ -107,9 +181,10 @@ void shot_presets_go_to(int preset_index)
 	blog(LOG_INFO,
 	     "[Shot Presets] shot_presets_go_to(%d) called, g_active_instance=%p",
 	     preset_index, (void *)g_active_instance);
-	if (g_active_instance)
+	if (g_active_instance) {
+		bind_home_scene_if_needed(g_active_instance);
 		go_to_preset(g_active_instance, preset_index);
-	else
+	} else
 		blog(LOG_WARNING,
 		     "[Shot Presets] go_to: no active instance — is the "
 		     "source with the filter in the current scene?");
@@ -120,9 +195,10 @@ void shot_presets_cut(int preset_index)
 	blog(LOG_INFO,
 	     "[Shot Presets] shot_presets_cut(%d) called, g_active_instance=%p",
 	     preset_index, (void *)g_active_instance);
-	if (g_active_instance)
+	if (g_active_instance) {
+		bind_home_scene_if_needed(g_active_instance);
 		cut_to_preset(g_active_instance, preset_index);
-	else
+	} else
 		blog(LOG_WARNING,
 		     "[Shot Presets] cut: no active instance");
 }
@@ -181,6 +257,7 @@ void shot_presets_capture(int preset_index)
 	    preset_index >= g_active_instance->num_presets)
 		return;
 	struct shot_presets_data *d = g_active_instance;
+	bind_home_scene_if_needed(d);
 	if (capture_transform(d, &d->presets[preset_index])) {
 		d->presets[preset_index].active = true;
 		/* Route subsequent live-edit-while-parked writes into THIS
@@ -507,6 +584,52 @@ static int   lerp_i(int a, int b, float t) { return (int)((float)a + ((float)b -
 
 /* Walk the current scene (or preview in studio mode) to find the
  * scene item that corresponds to this filter's parent source. */
+/* Is the named scene in the filter's enabled list? Unbound (empty list)
+ * matches every scene so initial setup doesn't require the user to first
+ * tick a checkbox. */
+static bool is_scene_enabled(struct shot_presets_data *d, const char *name)
+{
+	if (!name)
+		return false;
+	if (d->num_enabled_scenes == 0)
+		return true;
+	for (int i = 0; i < d->num_enabled_scenes; i++) {
+		if (strcmp(d->enabled_scenes[i], name) == 0)
+			return true;
+	}
+	return false;
+}
+
+/* If the enabled-scenes list is empty, seed it with the current scene.
+ * Called from explicit user actions (go_to / capture / cut) so the first
+ * scene in which the user actually drives shot presets becomes enabled.
+ * Also flips the corresponding `scene_enabled_<name>` bool in settings so
+ * the properties-dialog checkbox reflects the auto-binding next open. */
+static void bind_home_scene_if_needed(struct shot_presets_data *d)
+{
+	if (d->num_enabled_scenes > 0)
+		return;
+	obs_source_t *scene = obs_frontend_get_current_scene();
+	if (!scene)
+		scene = obs_frontend_get_current_preview_scene();
+	if (!scene)
+		return;
+	const char *name = obs_source_get_name(scene);
+	if (name && *name) {
+		snprintf(d->enabled_scenes[0], 256, "%s", name);
+		d->num_enabled_scenes = 1;
+		blog(LOG_INFO,
+		     "[Shot Presets] auto-enabled in scene '%s'", name);
+		obs_data_t *settings = obs_source_get_settings(d->source);
+		char key[320];
+		snprintf(key, sizeof(key), "scene_enabled_%s", name);
+		obs_data_set_bool(settings, key, true);
+		save_presets(d, settings);
+		obs_data_release(settings);
+	}
+	obs_source_release(scene);
+}
+
 static obs_sceneitem_t *find_scene_item(struct shot_presets_data *d)
 {
 	obs_source_t *parent = obs_filter_get_parent(d->source);
@@ -520,6 +643,17 @@ static obs_sceneitem_t *find_scene_item(struct shot_presets_data *d)
 		scene_source = obs_frontend_get_current_preview_scene();
 	if (!scene_source)
 		return NULL;
+
+	/* Only target the sceneitem if this scene is enabled for shot
+	 * presets. When the user is on an un-enabled scene (e.g. a guest
+	 * layout that also references the webcam), shot-preset clicks are
+	 * no-ops — the sceneitem there keeps whatever transform the user
+	 * configured in OBS. */
+	const char *scene_name = obs_source_get_name(scene_source);
+	if (!is_scene_enabled(d, scene_name)) {
+		obs_source_release(scene_source);
+		return NULL;
+	}
 
 	obs_scene_t *scene = obs_scene_from_source(scene_source);
 	obs_sceneitem_t *item = NULL;
@@ -782,24 +916,97 @@ void go_to_preset(struct shot_presets_data *d, int index)
 	if (d->active_duration_ms < 50)
 		d->active_duration_ms = 400;
 
-	/* Normalise both endpoints to centre-aligned so interpolation
-	 * produces a centred pan+zoom rather than a corner-anchored fly. */
-	obs_source_t *parent = obs_filter_get_parent(d->source);
-	if (parent) {
-		uint32_t sw = obs_source_get_width(parent);
-		uint32_t sh = obs_source_get_height(parent);
-		if (sw && sh) {
-			normalize_preset_to_center(&d->from, sw, sh);
-			normalize_preset_to_center(&d->to,   sw, sh);
-			/* If the endpoints have different bounds_type, apply_transform
-			 * would hold to->bounds_type all frame while lerping bounds
-			 * from→to — which renders 0×0 (black) at t≈0 whenever either
-			 * bounds value is zero. Flatten both to NONE+equivalent-scale
-			 * for the animation; the original target bounds_type is
-			 * restored at finish. */
-			if (d->from.bounds_type != d->to.bounds_type) {
-				normalize_preset_to_none(&d->from, sw, sh);
-				normalize_preset_to_none(&d->to,   sw, sh);
+	bool is_fade = (d->presets[index].transition_type == SHOT_TRANSITION_FADE);
+	d->fade_enabled = false;
+	d->fade_t = 0.0f;
+
+	if (is_fade) {
+		/* Set up cross-dissolve. Need: (1) current sceneitem box
+		 * matrix (from framing), (2) target box matrix computed by
+		 * temporarily applying `to` framing, (3) override sceneitem
+		 * to "identity fill canvas" so the canvas-sized filter
+		 * output maps 1:1 onto canvas during the fade. */
+		obs_sceneitem_t *item = find_scene_item(d);
+		struct obs_video_info ovi;
+		bool got_ovi = obs_get_video_info(&ovi);
+		if (item && got_ovi) {
+			uint32_t cw = ovi.base_width;
+			uint32_t ch = ovi.base_height;
+			obs_source_t *parent = obs_filter_get_parent(d->source);
+			uint32_t sw = parent ? obs_source_get_width(parent) : 0;
+			uint32_t sh = parent ? obs_source_get_height(parent) : 0;
+
+			if (sw && sh && cw && ch) {
+				/* (1) box matrix for the current framing. */
+				obs_sceneitem_get_box_transform(item, &d->fade_from_mtx);
+
+				/* (2) apply `to` temporarily, read its matrix. */
+				struct shot_preset to_tmp = d->presets[index];
+				apply_transform(d, &to_tmp, &to_tmp, 1.0f);
+				obs_sceneitem_force_update_transform(item);
+				obs_sceneitem_get_box_transform(item, &d->fade_to_mtx);
+
+				/* (3) override to identity-fill-canvas. With the
+				 * filter reporting canvas dims, this draws the
+				 * canvas-sized filter output at (0,0) 1:1. */
+				struct shot_preset id = {0};
+				snprintf(id.name, sizeof(id.name), "_fade_id_");
+				id.active = true;
+				id.scale_x = 1.0f;
+				id.scale_y = 1.0f;
+				id.alignment = OBS_ALIGN_TOP | OBS_ALIGN_LEFT;
+				id.bounds_type = OBS_BOUNDS_NONE;
+				apply_transform(d, &id, &id, 1.0f);
+				obs_sceneitem_force_update_transform(item);
+
+				d->fade_canvas_w = cw;
+				d->fade_canvas_h = ch;
+				d->fade_src_w = sw;
+				d->fade_src_h = sh;
+				d->fade_enabled = true;
+				d->fade_diag_frames = 0;
+				blog(LOG_INFO,
+				     "[Shot Presets] fade START cw=%u ch=%u sw=%u sh=%u "
+				     "effect=%p texrender=%p from_mtx[0]=(%.2f,%.2f,%.2f,%.2f) "
+				     "to_mtx[0]=(%.2f,%.2f,%.2f,%.2f)",
+				     cw, ch, sw, sh,
+				     (void *)d->fade_effect,
+				     (void *)d->fade_source_cap,
+				     d->fade_from_mtx.x.x, d->fade_from_mtx.x.y,
+				     d->fade_from_mtx.x.z, d->fade_from_mtx.x.w,
+				     d->fade_to_mtx.x.x, d->fade_to_mtx.x.y,
+				     d->fade_to_mtx.x.z, d->fade_to_mtx.x.w);
+			}
+		}
+		if (!d->fade_enabled)
+			blog(LOG_WARNING,
+			     "[Shot Presets] fade setup failed; falling "
+			     "back to move for this transition");
+	}
+
+	if (!d->fade_enabled) {
+		/* Move path: normalise both endpoints to centre-aligned so
+		 * interpolation produces a centred pan+zoom rather than a
+		 * corner-anchored fly. */
+		obs_source_t *parent = obs_filter_get_parent(d->source);
+		if (parent) {
+			uint32_t sw = obs_source_get_width(parent);
+			uint32_t sh = obs_source_get_height(parent);
+			if (sw && sh) {
+				normalize_preset_to_center(&d->from, sw, sh);
+				normalize_preset_to_center(&d->to,   sw, sh);
+				/* If the endpoints have different bounds_type,
+				 * apply_transform would hold to->bounds_type all
+				 * frame while lerping bounds from→to — which
+				 * renders 0×0 (black) at t≈0 whenever either
+				 * bounds value is zero. Flatten both to
+				 * NONE+equivalent-scale for the animation; the
+				 * original target bounds_type is restored at
+				 * finish. */
+				if (d->from.bounds_type != d->to.bounds_type) {
+					normalize_preset_to_none(&d->from, sw, sh);
+					normalize_preset_to_none(&d->to,   sw, sh);
+				}
 			}
 		}
 	}
@@ -929,6 +1136,19 @@ void save_presets(struct shot_presets_data *d, obs_data_t *settings)
 	}
 	obs_data_set_array(settings, "presets", arr);
 	obs_data_array_release(arr);
+
+	/* Persist enabled scenes both as an explicit array (primary record)
+	 * and as scene_enabled_<name> bools (so the properties-dialog
+	 * checkboxes stay in sync). */
+	obs_data_array_t *sarr = obs_data_array_create();
+	for (int i = 0; i < d->num_enabled_scenes; i++) {
+		obs_data_t *obj = obs_data_create();
+		obs_data_set_string(obj, "name", d->enabled_scenes[i]);
+		obs_data_array_push_back(sarr, obj);
+		obs_data_release(obj);
+	}
+	obs_data_set_array(settings, "enabled_scenes", sarr);
+	obs_data_array_release(sarr);
 }
 
 /* ── Filter callbacks ────────────────────────────────────── */
@@ -944,6 +1164,19 @@ static void *filter_create(obs_data_t *settings, obs_source_t *source)
 	struct shot_presets_data *d = bzalloc(sizeof(*d));
 	d->source = source;
 	d->current_preset = -1;
+
+	obs_enter_graphics();
+	char *err = NULL;
+	d->fade_effect = gs_effect_create(FADE_EFFECT_HLSL,
+	                                  "shot-presets-fade.effect", &err);
+	d->fade_source_cap = gs_texrender_create(GS_RGBA, GS_ZS_NONE);
+	obs_leave_graphics();
+	if (!d->fade_effect) {
+		blog(LOG_ERROR,
+		     "[Shot Presets] fade effect compile failed: %s",
+		     err ? err : "(no error message)");
+	}
+	if (err) bfree(err);
 	if (g_instance_count < MAX_INSTANCES) {
 		g_instances[g_instance_count].filter_source = source;
 		g_instances[g_instance_count].data = d;
@@ -964,6 +1197,33 @@ static void *filter_create(obs_data_t *settings, obs_source_t *source)
 		d->duration_ms = 400;
 	d->easing_type = (int)obs_data_get_int(settings, "easing_type");
 	d->easing_function = (int)obs_data_get_int(settings, "easing_function");
+
+	/* Enabled-scenes list. Prefer the explicit array if present;
+	 * fall back to legacy `home_scene` string for backward compat. */
+	obs_data_array_t *sarr = obs_data_get_array(settings, "enabled_scenes");
+	if (sarr) {
+		size_t count = obs_data_array_count(sarr);
+		if (count > MAX_ENABLED_SCENES)
+			count = MAX_ENABLED_SCENES;
+		for (size_t i = 0; i < count; i++) {
+			obs_data_t *obj = obs_data_array_item(sarr, i);
+			const char *nm = obs_data_get_string(obj, "name");
+			if (nm && *nm) {
+				snprintf(d->enabled_scenes[d->num_enabled_scenes],
+				         256, "%s", nm);
+				d->num_enabled_scenes++;
+			}
+			obs_data_release(obj);
+		}
+		obs_data_array_release(sarr);
+	} else {
+		const char *legacy_hs =
+			obs_data_get_string(settings, "home_scene");
+		if (legacy_hs && *legacy_hs) {
+			snprintf(d->enabled_scenes[0], 256, "%s", legacy_hs);
+			d->num_enabled_scenes = 1;
+		}
+	}
 
 	/* Load saved presets */
 	obs_data_array_t *arr = obs_data_get_array(settings, "presets");
@@ -1027,6 +1287,7 @@ static void *filter_create(obs_data_t *settings, obs_source_t *source)
 		dstr_free(&hk_desc);
 	}
 
+	blog(LOG_INFO, "[Shot Presets] filter_create returning d=%p", (void *)d);
 	return d;
 }
 
@@ -1042,6 +1303,12 @@ static void filter_destroy(void *data)
 	}
 	if (g_active_instance == d)
 		g_active_instance = NULL;
+	if (d->fade_effect || d->fade_source_cap) {
+		obs_enter_graphics();
+		if (d->fade_effect) gs_effect_destroy(d->fade_effect);
+		if (d->fade_source_cap) gs_texrender_destroy(d->fade_source_cap);
+		obs_leave_graphics();
+	}
 	bfree(d);
 }
 
@@ -1129,66 +1396,30 @@ static bool on_remove_preset(obs_properties_t *props, obs_property_t *prop,
 
 static obs_properties_t *filter_properties(void *data)
 {
-	struct shot_presets_data *d = data;
+	UNUSED_PARAMETER(data);
 	obs_properties_t *props = obs_properties_create();
 
-	/* Transition settings */
-	obs_properties_add_int(props, "duration",
-		"Transition Duration (ms)", 50, 5000, 50);
+	/* The Shot Presets dock owns all the preset UI. This dialog is just
+	 * the per-scene enable/disable checkboxes: tick every scene where
+	 * this filter should drive shot presets. Leave all unchecked to
+	 * apply in any scene containing the parent source. */
+	obs_properties_add_text(props, "scene_help",
+		"Enable Shot Presets in these scenes "
+		"(leave all unchecked to use in any scene):",
+		OBS_TEXT_INFO);
 
-	obs_property_t *et = obs_properties_add_list(props, "easing_type",
-		"Easing Type", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
-	obs_property_list_add_int(et, "None", EASE_NONE);
-	obs_property_list_add_int(et, "Ease In", EASE_IN);
-	obs_property_list_add_int(et, "Ease Out", EASE_OUT);
-	obs_property_list_add_int(et, "Ease In/Out", EASE_IN_OUT);
-
-	obs_property_t *ef = obs_properties_add_list(props, "easing_function",
-		"Easing Function", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
-	obs_property_list_add_int(ef, "Linear", EASING_LINEAR);
-	obs_property_list_add_int(ef, "Quadratic", EASING_QUADRATIC);
-	obs_property_list_add_int(ef, "Cubic", EASING_CUBIC);
-	obs_property_list_add_int(ef, "Quartic", EASING_QUARTIC);
-	obs_property_list_add_int(ef, "Quintic", EASING_QUINTIC);
-	obs_property_list_add_int(ef, "Sine", EASING_SINE);
-	obs_property_list_add_int(ef, "Circular", EASING_CIRCULAR);
-	obs_property_list_add_int(ef, "Exponential", EASING_EXPONENTIAL);
-	obs_property_list_add_int(ef, "Elastic", EASING_ELASTIC);
-	obs_property_list_add_int(ef, "Bounce", EASING_BOUNCE);
-	obs_property_list_add_int(ef, "Back", EASING_BACK);
-
-	/* Per-preset controls */
-	for (int i = 0; i < d->num_presets; i++) {
-		char prop_name[64], get_btn[64], go_btn[64];
-		struct dstr label = {0};
-
-		snprintf(prop_name, sizeof(prop_name), "preset_name_%d", i);
-		dstr_printf(&label, "Preset %d Name", i + 1);
-		obs_properties_add_text(props, prop_name, label.array,
-		                        OBS_TEXT_DEFAULT);
-		dstr_free(&label);
-
-		snprintf(get_btn, sizeof(get_btn), "get_transform_%d", i);
-		dstr_printf(&label, "Get Transform → %s", d->presets[i].name);
-		obs_properties_add_button2(props, get_btn, label.array,
-		                           on_get_transform, d);
-		dstr_free(&label);
-
-		snprintf(go_btn, sizeof(go_btn), "go_to_%d", i);
-		dstr_printf(&label, "%s Go To %s",
-		            d->presets[i].active ? "[Ready]" : "[Empty]",
-		            d->presets[i].name);
-		obs_properties_add_button2(props, go_btn, label.array,
-		                           on_go_to, d);
-		dstr_free(&label);
+	struct obs_frontend_source_list scenes = {0};
+	obs_frontend_get_scenes(&scenes);
+	for (size_t i = 0; i < scenes.sources.num; i++) {
+		const char *name =
+			obs_source_get_name(scenes.sources.array[i]);
+		if (!name || !*name)
+			continue;
+		char key[320];
+		snprintf(key, sizeof(key), "scene_enabled_%s", name);
+		obs_properties_add_bool(props, key, name);
 	}
-
-	obs_properties_add_button2(props, "add_preset", "+ Add Preset",
-	                           on_add_preset, d);
-	if (d->num_presets > 0)
-		obs_properties_add_button2(props, "remove_preset",
-		                           "- Remove Last Preset",
-		                           on_remove_preset, d);
+	obs_frontend_source_list_free(&scenes);
 
 	return props;
 }
@@ -1208,6 +1439,30 @@ static void filter_update(void *data, obs_data_t *settings)
 		d->duration_ms = 400;
 	d->easing_type = (int)obs_data_get_int(settings, "easing_type");
 	d->easing_function = (int)obs_data_get_int(settings, "easing_function");
+
+	/* Rebuild the enabled-scenes list from per-scene checkbox state.
+	 * Every scene currently known to the frontend gets a `scene_enabled_<name>`
+	 * bool; we collect the true ones into the in-memory list. */
+	d->num_enabled_scenes = 0;
+	struct obs_frontend_source_list scenes = {0};
+	obs_frontend_get_scenes(&scenes);
+	for (size_t i = 0;
+	     i < scenes.sources.num &&
+	     d->num_enabled_scenes < MAX_ENABLED_SCENES;
+	     i++) {
+		const char *name =
+			obs_source_get_name(scenes.sources.array[i]);
+		if (!name || !*name)
+			continue;
+		char key[320];
+		snprintf(key, sizeof(key), "scene_enabled_%s", name);
+		if (obs_data_get_bool(settings, key)) {
+			snprintf(d->enabled_scenes[d->num_enabled_scenes],
+			         256, "%s", name);
+			d->num_enabled_scenes++;
+		}
+	}
+	obs_frontend_source_list_free(&scenes);
 
 	for (int i = 0; i < d->num_presets; i++) {
 		char prop_name[64];
@@ -1315,37 +1570,191 @@ static void filter_tick(void *data, float seconds)
 		finished = true;
 	}
 
-	float eased_t = get_eased(t, d->easing_type, d->easing_function);
-	apply_transform(d, &d->from, &d->to, eased_t);
+	if (d->fade_enabled) {
+		/* Cross-dissolve: transform stays at "identity fill canvas"
+		 * on the sceneitem for the whole fade; filter_render draws
+		 * the source twice with from_mtx/to_mtx. Here we just drive
+		 * t so filter_render knows the blend weight. */
+		d->fade_t = get_eased(t, d->easing_type, d->easing_function);
+	} else {
+		float eased_t = get_eased(t, d->easing_type, d->easing_function);
+		apply_transform(d, &d->from, &d->to, eased_t);
+	}
 
 	if (finished) {
-		/* d->to was flattened to bounds_type=NONE for the animation when
-		 * the endpoints had mismatched bounds_types. Snap to the original
-		 * preset now so the parked sceneitem carries the user's real
-		 * bounds_type/bounds/alignment — matters for OBS's Edit Transform
-		 * dialog and for how the source adapts to resolution changes. */
-		if (d->current_preset >= 0 &&
-		    d->current_preset < d->num_presets &&
-		    d->presets[d->current_preset].active) {
-			struct shot_preset final = d->presets[d->current_preset];
-			apply_transform(d, &final, &final, 1.0f);
+		if (d->fade_enabled) {
+			/* Restore the real target transform so the parked
+			 * sceneitem reflects the user's preset, not the
+			 * identity-fill-canvas override. */
+			if (d->current_preset >= 0 &&
+			    d->current_preset < d->num_presets &&
+			    d->presets[d->current_preset].active) {
+				struct shot_preset final =
+					d->presets[d->current_preset];
+				apply_transform(d, &final, &final, 1.0f);
+			}
+			d->fade_enabled = false;
+			d->fade_t = 1.0f;
+			blog(LOG_INFO,
+			     "[Shot Presets] fade FINISH after %.3f s",
+			     d->running_duration);
+		} else {
+			/* d->to was flattened to bounds_type=NONE for the
+			 * animation when the endpoints had mismatched
+			 * bounds_types. Snap to the original preset now so the
+			 * parked sceneitem carries the user's real
+			 * bounds_type/bounds/alignment. */
+			if (d->current_preset >= 0 &&
+			    d->current_preset < d->num_presets &&
+			    d->presets[d->current_preset].active) {
+				struct shot_preset final =
+					d->presets[d->current_preset];
+				apply_transform(d, &final, &final, 1.0f);
+			}
+			blog(LOG_INFO,
+			     "[Shot Presets] move FINISH after %.3f s",
+			     d->running_duration);
 		}
 		/* Reset debounce so first post-animation sync waits a beat. */
 		d->sync_debounce = 0.0f;
 		d->sync_dirty = false;
-		blog(LOG_INFO,
-		     "[Shot Presets] move FINISH after %.3f s",
-		     d->running_duration);
 	}
 }
 
-/* ── video_render — passthrough (no pixel changes) ───────── */
+/* ── Size callbacks ──────────────────────────────────────────
+ * During a cross-dissolve the filter produces a canvas-sized output
+ * that composites the source at two different framings. OBS queries
+ * these to size the filter's output texture and set up the
+ * projection, so reporting canvas dims here is what makes the
+ * canvas-space compositing line up with the scene. */
+
+/* Use get_target (the source as it feeds INTO this filter) + base_width
+ * to avoid re-entering the filter chain and recursing infinitely. */
+static uint32_t filter_get_width(void *data)
+{
+	struct shot_presets_data *d = data;
+	if (d->fade_enabled && d->fade_canvas_w > 0)
+		return d->fade_canvas_w;
+	obs_source_t *target = obs_filter_get_target(d->source);
+	return target ? obs_source_get_base_width(target) : 0;
+}
+
+static uint32_t filter_get_height(void *data)
+{
+	struct shot_presets_data *d = data;
+	if (d->fade_enabled && d->fade_canvas_h > 0)
+		return d->fade_canvas_h;
+	obs_source_t *target = obs_filter_get_target(d->source);
+	return target ? obs_source_get_base_height(target) : 0;
+}
+
+/* ── video_render ────────────────────────────────────────────
+ * Pass-through when not fading. During a cross-dissolve, capture
+ * the source pixels into a source-sized texrender, then draw that
+ * capture twice into the current (canvas-sized) filter output using
+ * fade_from_mtx / fade_to_mtx at complementary opacities — giving a
+ * true cross-fade between the two framings. */
+
+static void draw_capture_at_matrix(gs_effect_t *effect, gs_texture_t *tex,
+                                   const struct matrix4 *mtx, float opacity,
+                                   uint32_t sw, uint32_t sh)
+{
+	gs_eparam_t *p_img = gs_effect_get_param_by_name(effect, "image");
+	gs_eparam_t *p_op  = gs_effect_get_param_by_name(effect, "opacity");
+	if (p_img) gs_effect_set_texture(p_img, tex);
+	if (p_op)  gs_effect_set_float(p_op, opacity);
+
+	/* sprite verts are in (0..sw, 0..sh); the sceneitem box matrix
+	 * maps normalized (0..1) box-space to canvas-space. Pre-scale the
+	 * verts down to 0..1 before the matrix sends them to canvas. */
+	gs_matrix_push();
+	gs_matrix_mul(mtx);
+	gs_matrix_scale3f(1.0f / (float)sw, 1.0f / (float)sh, 1.0f);
+	while (gs_effect_loop(effect, "Draw"))
+		gs_draw_sprite(tex, 0, 0, 0);
+	gs_matrix_pop();
+}
 
 static void filter_render(void *data, gs_effect_t *effect)
 {
 	struct shot_presets_data *d = data;
-	obs_source_skip_video_filter(d->source);
 	UNUSED_PARAMETER(effect);
+
+	if (!d->fade_enabled || !d->fade_effect || !d->fade_source_cap) {
+		obs_source_skip_video_filter(d->source);
+		return;
+	}
+
+	uint32_t sw = d->fade_src_w;
+	uint32_t sh = d->fade_src_h;
+	uint32_t cw = d->fade_canvas_w;
+	uint32_t ch = d->fade_canvas_h;
+	if (!sw || !sh || !cw || !ch) {
+		obs_source_skip_video_filter(d->source);
+		return;
+	}
+
+	/* Step 1 — capture source pixels (what our filter would see as
+	 * input) into a source-sized offscreen texture, so we can draw
+	 * it multiple times into the canvas-sized output.
+	 *
+	 * Pattern matters: process_filter_begin FIRST (it sets up filter
+	 * input state), THEN texrender_begin, ortho, process_filter_end,
+	 * texrender_end. Reversing these silently produces an empty tex. */
+	if (obs_source_process_filter_begin(d->source, GS_RGBA,
+	                                    OBS_ALLOW_DIRECT_RENDERING)) {
+		gs_texrender_reset(d->fade_source_cap);
+		if (gs_texrender_begin(d->fade_source_cap, sw, sh)) {
+			struct vec4 clear;
+			vec4_zero(&clear);
+			gs_clear(GS_CLEAR_COLOR, &clear, 0.0f, 0);
+			gs_ortho(0.0f, (float)sw, 0.0f, (float)sh,
+			         -100.0f, 100.0f);
+
+			obs_source_process_filter_end(d->source,
+				obs_get_base_effect(OBS_EFFECT_DEFAULT),
+				sw, sh);
+
+			gs_texrender_end(d->fade_source_cap);
+		}
+	}
+	gs_texture_t *cap = gs_texrender_get_texture(d->fade_source_cap);
+	if (d->fade_diag_frames < 3) {
+		blog(LOG_INFO,
+		     "[Shot Presets] fade render frame=%d t=%.3f sw=%u sh=%u "
+		     "cw=%u ch=%u cap=%p effect=%p",
+		     d->fade_diag_frames, d->fade_t, sw, sh, cw, ch,
+		     (void *)cap, (void *)d->fade_effect);
+		d->fade_diag_frames++;
+	}
+	if (!cap) {
+		obs_source_skip_video_filter(d->source);
+		return;
+	}
+
+	/* Step 2 — we're now back in the filter's (canvas-sized) output
+	 * render target. Draw the capture twice, cross-blended. */
+	float t = d->fade_t;
+	float op_from = 1.0f - t;
+	float op_to   = t;
+
+	/* Additive blending onto the cleared (transparent black) target so
+	 * the two passes sum to from*(1-t) + to*t. SRCALPHA/INVSRCALPHA
+	 * would double-darken the mid-point (second pass draws onto an
+	 * already-faded buffer, compounding the attenuation). */
+	gs_blend_state_push();
+	gs_enable_blending(true);
+	gs_blend_function(GS_BLEND_ONE, GS_BLEND_ONE);
+	gs_enable_depth_test(false);
+
+	if (op_from > 0.001f)
+		draw_capture_at_matrix(d->fade_effect, cap,
+		                       &d->fade_from_mtx, op_from, sw, sh);
+	if (op_to > 0.001f)
+		draw_capture_at_matrix(d->fade_effect, cap,
+		                       &d->fade_to_mtx, op_to, sw, sh);
+
+	gs_blend_state_pop();
 }
 
 /* OBS calls this when saving the scene collection. Flush the in-memory
@@ -1357,6 +1766,9 @@ static void filter_save(void *data, obs_data_t *settings)
 	save_presets(d, settings);
 	d->sync_dirty = false;
 	d->sync_debounce = 0.0f;
+	blog(LOG_INFO,
+	     "[Shot Presets] filter_save flushed %d presets for instance=%p",
+	     d->num_presets, (void *)d);
 }
 
 /* ── Registration ────────────────────────────────────────── */
@@ -1374,6 +1786,8 @@ static struct obs_source_info shot_presets_filter_info = {
 	.save = filter_save,
 	.video_tick = filter_tick,
 	.video_render = filter_render,
+	.get_width = filter_get_width,
+	.get_height = filter_get_height,
 };
 
 /* Defined in shot-presets-dock.cpp */
@@ -1405,8 +1819,17 @@ static void update_active_for_current_scene(void)
 			const char *pname = obs_source_get_name(parent);
 			if (!pname)
 				continue;
+			struct shot_presets_data *cand =
+				g_instances[i].data;
+			/* Honor enabled-scene list: a filter only activates
+			 * in scenes the user has ticked. Unbound filters
+			 * (empty list) fall back to matching any scene
+			 * containing their source — so the dock is reachable
+			 * for initial setup. */
+			if (!is_scene_enabled(cand, scene_name))
+				continue;
 			if (obs_scene_find_source_recursive(scene, pname)) {
-				match = g_instances[i].data;
+				match = cand;
 				matched_source = pname;
 				break;
 			}

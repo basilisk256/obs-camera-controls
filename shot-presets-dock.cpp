@@ -204,6 +204,7 @@ void ShotPresetsDock::refreshUI()
 			QComboBox *transCb = new QComboBox();
 			transCb->addItem("Move (animated)", 0);
 			transCb->addItem("Cut (instant)", 1);
+			transCb->addItem("Fade", 2);
 			transCb->setToolTip(
 				"How the main preset button transitions to this shot");
 			connect(transCb,
