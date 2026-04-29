@@ -1389,27 +1389,36 @@ void save_presets(struct shot_presets_data *d, obs_data_t *settings)
 	 * divergence if someone downgrades. */
 	obs_data_erase(settings, "presets");
 
-	/* Persistence visibility — every save logs a one-liner with bucket
-	 * count and per-bucket preset counts so persistence problems are
-	 * visible in the OBS log without digging through scene_collection.json. */
+	/* Persistence visibility — every save logs which buckets and which
+	 * presets (with active flag) were just written to settings. Lets us
+	 * trace persistence issues without parsing scene_collection.json. */
 	{
-		struct dstr summary = {0};
-		dstr_init(&summary);
+		blog(LOG_INFO,
+		     "[Shot Presets] === save_presets START (instance=%p, %d buckets) ===",
+		     (void *)d, d->num_buckets);
 		for (int i = 0; i < d->num_buckets; i++) {
-			if (i > 0) dstr_cat(&summary, ", ");
-			char tmp[320];
-			snprintf(tmp, sizeof(tmp), "'%s'=%d",
-			         d->buckets[i].scene_name[0]
-				         ? d->buckets[i].scene_name
-				         : "(default)",
-			         d->buckets[i].num_presets);
-			dstr_cat(&summary, tmp);
+			struct shot_preset_bucket *bk = &d->buckets[i];
+			struct dstr presets_str = {0};
+			dstr_init(&presets_str);
+			for (int j = 0; j < bk->num_presets; j++) {
+				if (j > 0) dstr_cat(&presets_str, ", ");
+				char tmp[256];
+				snprintf(tmp, sizeof(tmp), "[%d]'%s'%s",
+				         j, bk->presets[j].name,
+				         bk->presets[j].active ? "" : "(empty)");
+				dstr_cat(&presets_str, tmp);
+			}
+			blog(LOG_INFO,
+			     "[Shot Presets]   bucket '%s': %d presets, "
+			     "default=%d current=%d ua=%d  -> %s",
+			     bk->scene_name[0] ? bk->scene_name : "(default)",
+			     bk->num_presets, bk->default_preset,
+			     bk->current_preset, bk->user_activated,
+			     presets_str.array ? presets_str.array : "(empty)");
+			dstr_free(&presets_str);
 		}
 		blog(LOG_INFO,
-		     "[Shot Presets] save_presets wrote %d buckets: %s",
-		     d->num_buckets,
-		     summary.array ? summary.array : "(none)");
-		dstr_free(&summary);
+		     "[Shot Presets] === save_presets END ===");
 	}
 
 	/* Persist enabled scenes both as an explicit array (primary record)
@@ -1648,8 +1657,39 @@ static void *filter_create(obs_data_t *settings, obs_source_t *source)
 		dstr_free(&hk_desc);
 	}
 
-	blog(LOG_INFO, "[Shot Presets] filter_create returning d=%p (buckets=%d)",
-	     (void *)d, d->num_buckets);
+	/* Dump loaded state so we can correlate "what was on disk" vs "what
+	 * runtime sees" when diagnosing per-scene persistence issues. */
+	{
+		obs_source_t *parent = obs_filter_get_parent(source);
+		const char *pname = parent ? obs_source_get_name(parent)
+		                           : "(no parent yet)";
+		blog(LOG_INFO,
+		     "[Shot Presets] === filter_create LOADED (instance=%p, "
+		     "source='%s', %d buckets, has_legacy=%d) ===",
+		     (void *)d, pname ? pname : "(null)",
+		     d->num_buckets, d->has_legacy_template);
+		for (int i = 0; i < d->num_buckets; i++) {
+			struct shot_preset_bucket *bk = &d->buckets[i];
+			struct dstr presets_str = {0};
+			dstr_init(&presets_str);
+			for (int j = 0; j < bk->num_presets; j++) {
+				if (j > 0) dstr_cat(&presets_str, ", ");
+				char tmp[256];
+				snprintf(tmp, sizeof(tmp), "[%d]'%s'%s",
+				         j, bk->presets[j].name,
+				         bk->presets[j].active ? "" : "(empty)");
+				dstr_cat(&presets_str, tmp);
+			}
+			blog(LOG_INFO,
+			     "[Shot Presets]   loaded bucket '%s': %d presets, "
+			     "default=%d current=%d  -> %s",
+			     bk->scene_name[0] ? bk->scene_name : "(default)",
+			     bk->num_presets, bk->default_preset,
+			     bk->current_preset,
+			     presets_str.array ? presets_str.array : "(empty)");
+			dstr_free(&presets_str);
+		}
+	}
 	return d;
 }
 
@@ -2230,20 +2270,42 @@ static void update_active_for_current_scene(void)
 		}
 	}
 	g_active_instance = match;
-	int bucket_count = 0;
-	int active_bucket_presets = 0;
 	if (match) {
-		bucket_count = match->num_buckets;
 		struct shot_preset_bucket *bk = peek_active_bucket(match);
-		if (bk) active_bucket_presets = bk->num_presets;
+		struct dstr presets_str = {0};
+		dstr_init(&presets_str);
+		if (bk) {
+			for (int j = 0; j < bk->num_presets; j++) {
+				if (j > 0) dstr_cat(&presets_str, ", ");
+				char tmp[256];
+				snprintf(tmp, sizeof(tmp), "[%d]'%s'%s",
+				         j, bk->presets[j].name,
+				         bk->presets[j].active ? "" : "(empty)");
+				dstr_cat(&presets_str, tmp);
+			}
+		}
+		blog(LOG_INFO,
+		     "[Shot Presets] scene='%s' instances=%d active=%p "
+		     "source='%s' total_buckets=%d  active_bucket='%s' "
+		     "(default=%d current=%d ua=%d) -> %s",
+		     scene_name ? scene_name : "(null)", g_instance_count,
+		     (void *)g_active_instance,
+		     matched_source ? matched_source : "(none)",
+		     match->num_buckets,
+		     bk ? (bk->scene_name[0] ? bk->scene_name : "(default)")
+		        : "(none yet)",
+		     bk ? bk->default_preset : -1,
+		     bk ? bk->current_preset : -1,
+		     bk ? bk->user_activated : 0,
+		     presets_str.array ? presets_str.array : "(none)");
+		dstr_free(&presets_str);
+	} else {
+		blog(LOG_INFO,
+		     "[Shot Presets] scene='%s' instances=%d active=NULL "
+		     "(no filter source in this scene OR scene restricted "
+		     "via properties)",
+		     scene_name ? scene_name : "(null)", g_instance_count);
 	}
-	blog(LOG_INFO,
-	     "[Shot Presets] scene='%s' instances=%d active=%p (source='%s') "
-	     "buckets=%d active_bucket_presets=%d",
-	     scene_name ? scene_name : "(null)", g_instance_count,
-	     (void *)g_active_instance,
-	     matched_source ? matched_source : "(none)",
-	     bucket_count, active_bucket_presets);
 	obs_source_release(scene_src);
 
 	/* Baseline snap: on scene activation, put the sceneitem into a
