@@ -27,10 +27,9 @@ private slots:
 	void onPresetDurationChanged(int index, int value);
 	void onTransitionChanged(int index, int type);
 	void onNameChanged(int index, const QString &name);
-	void onCropChanged(int index);
-	void onTransformChanged(int index);
 	void onAddPreset();
 	void onRemovePreset(int index);
+	void onDefaultToggled(int index);
 	void refreshUI();
 
 private:
@@ -51,24 +50,11 @@ private:
 		QPushButton *cutBtn;
 		QPushButton *captureBtn;
 		QPushButton *editBtn;
+		QPushButton *defaultBtn;
 		QWidget *editPanel;
 		QSpinBox *presetDurSpin;
 		QComboBox *transitionCb;
 		QLineEdit *nameEdit;
-		QSpinBox *cropLSpin;
-		QSpinBox *cropTSpin;
-		QSpinBox *cropRSpin;
-		QSpinBox *cropBSpin;
-		QDoubleSpinBox *posXSpin;
-		QDoubleSpinBox *posYSpin;
-		QDoubleSpinBox *scaleXSpin;
-		QDoubleSpinBox *scaleYSpin;
-		QDoubleSpinBox *rotSpin;
-		QComboBox *alignCb;
-		QComboBox *boundsTypeCb;
-		QDoubleSpinBox *boundsWSpin;
-		QDoubleSpinBox *boundsHSpin;
-		QComboBox *boundsAlignCb;
 		QPushButton *removeBtn;
 	};
 	QVector<PresetRow> presetRows;

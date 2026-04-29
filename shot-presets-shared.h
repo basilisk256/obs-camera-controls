@@ -56,6 +56,13 @@ void shot_presets_remove_preset(int index);
 /* Is there an active Shot Presets filter on the current scene? */
 int shot_presets_has_active(void);
 
+/* Per-scene default preset. The filter snaps to this preset when the scene
+ * activates, instead of the last-clicked one. -1 = no default set (falls
+ * back to current_preset, then preset 0). Setting clears any previous
+ * default in the same scene's bucket. */
+int shot_presets_get_default_preset(void);
+void shot_presets_set_default_preset(int index);
+
 /* Enumerate scenes whose scene graph contains this filter's parent source.
  * The callback is invoked once per matching scene name. */
 typedef void (*shot_presets_scene_cb)(const char *scene_name, void *user);

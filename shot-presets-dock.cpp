@@ -13,6 +13,7 @@
 #include <QMainWindow>
 #include <QDockWidget>
 #include <QTimer>
+#include <QPointer>
 #include <QAction>
 
 /* ── Dock Widget ────────────────────────────────────────────── */
@@ -173,6 +174,23 @@ void ShotPresetsDock::refreshUI()
 				[this, i]() { onEditToggled(i); });
 			row->addWidget(editBtn);
 
+			/* Per-scene default toggle. Filled star = this preset is
+			 * the scene's default framing (snapped to on activation).
+			 * Click toggles; only one default per scene at a time. */
+			QPushButton *defBtn = new QPushButton(QString::fromUtf8("☆"));
+			defBtn->setToolTip(
+				"Set as scene default (snapped to on scene activation)");
+			defBtn->setFixedWidth(34);
+			defBtn->setMinimumHeight(40);
+			defBtn->setCheckable(true);
+			defBtn->setStyleSheet(
+				"QPushButton { font-size: 16px; padding: 2px; color: #888; }"
+				"QPushButton:checked { color: #ffd54a; background: #3a2f10; }"
+				"QPushButton:hover { color: #fff; }");
+			connect(defBtn, &QPushButton::clicked, this,
+				[this, i]() { onDefaultToggled(i); });
+			row->addWidget(defBtn);
+
 			QWidget *rowWidget = new QWidget();
 			rowWidget->setLayout(row);
 			rowContainerLayout->addWidget(rowWidget);
@@ -233,186 +251,11 @@ void ShotPresetsDock::refreshUI()
 			durRow2->addStretch();
 			epLayout->addLayout(durRow2);
 
-			/* Position / Scale / Rotation / Alignment.
-			 * All live-apply via shot_presets_set_transform
-			 * (same feel as the Crop fields below). */
-			QGridLayout *xformGrid = new QGridLayout();
-			xformGrid->setSpacing(4);
-
-			xformGrid->addWidget(new QLabel("Pos X:"), 0, 0);
-			QDoubleSpinBox *posX = new QDoubleSpinBox();
-			posX->setRange(-10000, 10000);
-			posX->setDecimals(1);
-			posX->setSingleStep(1.0);
-			xformGrid->addWidget(posX, 0, 1);
-			xformGrid->addWidget(new QLabel("Y:"), 0, 2);
-			QDoubleSpinBox *posY = new QDoubleSpinBox();
-			posY->setRange(-10000, 10000);
-			posY->setDecimals(1);
-			posY->setSingleStep(1.0);
-			xformGrid->addWidget(posY, 0, 3);
-
-			xformGrid->addWidget(new QLabel("Scale X:"), 1, 0);
-			QDoubleSpinBox *scX = new QDoubleSpinBox();
-			scX->setRange(0.001, 100.0);
-			scX->setDecimals(3);
-			scX->setSingleStep(0.01);
-			xformGrid->addWidget(scX, 1, 1);
-			xformGrid->addWidget(new QLabel("Y:"), 1, 2);
-			QDoubleSpinBox *scY = new QDoubleSpinBox();
-			scY->setRange(0.001, 100.0);
-			scY->setDecimals(3);
-			scY->setSingleStep(0.01);
-			xformGrid->addWidget(scY, 1, 3);
-
-			xformGrid->addWidget(new QLabel("Rotation:"), 2, 0);
-			QDoubleSpinBox *rot = new QDoubleSpinBox();
-			rot->setRange(-360.0, 360.0);
-			rot->setDecimals(2);
-			rot->setSuffix(" \u00B0");
-			rot->setSingleStep(1.0);
-			xformGrid->addWidget(rot, 2, 1);
-			xformGrid->addWidget(new QLabel("Align:"), 2, 2);
-			QComboBox *alignCb = new QComboBox();
-			alignCb->addItem("Top Left",   5);
-			alignCb->addItem("Top",        4);
-			alignCb->addItem("Top Right",  6);
-			alignCb->addItem("Left",       1);
-			alignCb->addItem("Center",     0);
-			alignCb->addItem("Right",      2);
-			alignCb->addItem("Bot Left",   9);
-			alignCb->addItem("Bottom",     8);
-			alignCb->addItem("Bot Right", 10);
-			xformGrid->addWidget(alignCb, 2, 3);
-			epLayout->addLayout(xformGrid);
-
-			QGridLayout *boundsGrid = new QGridLayout();
-			boundsGrid->setSpacing(4);
-			boundsGrid->addWidget(new QLabel("Bounds:"), 0, 0);
-			QComboBox *btCb = new QComboBox();
-			btCb->addItem("No bounds",          0);
-			btCb->addItem("Stretch",            1);
-			btCb->addItem("Fit (scale inner)",  2);
-			btCb->addItem("Fill (scale outer)", 3);
-			btCb->addItem("Scale to width",     4);
-			btCb->addItem("Scale to height",    5);
-			btCb->addItem("Max only",           6);
-			boundsGrid->addWidget(btCb, 0, 1, 1, 3);
-
-			boundsGrid->addWidget(new QLabel("W:"), 1, 0);
-			QDoubleSpinBox *bW = new QDoubleSpinBox();
-			bW->setRange(0.0, 10000.0);
-			bW->setDecimals(1);
-			bW->setSingleStep(1.0);
-			boundsGrid->addWidget(bW, 1, 1);
-			boundsGrid->addWidget(new QLabel("H:"), 1, 2);
-			QDoubleSpinBox *bH = new QDoubleSpinBox();
-			bH->setRange(0.0, 10000.0);
-			bH->setDecimals(1);
-			bH->setSingleStep(1.0);
-			boundsGrid->addWidget(bH, 1, 3);
-
-			boundsGrid->addWidget(new QLabel("B.Align:"), 2, 0);
-			QComboBox *bAlignCb = new QComboBox();
-			bAlignCb->addItem("Top Left",   5);
-			bAlignCb->addItem("Top",        4);
-			bAlignCb->addItem("Top Right",  6);
-			bAlignCb->addItem("Left",       1);
-			bAlignCb->addItem("Center",     0);
-			bAlignCb->addItem("Right",      2);
-			bAlignCb->addItem("Bot Left",   9);
-			bAlignCb->addItem("Bottom",     8);
-			bAlignCb->addItem("Bot Right", 10);
-			boundsGrid->addWidget(bAlignCb, 2, 1, 1, 3);
-			epLayout->addLayout(boundsGrid);
-
-			auto xformChanged = [this, i]() { onTransformChanged(i); };
-			connect(posX, QOverload<double>::of(&QDoubleSpinBox::valueChanged),
-				this, xformChanged);
-			connect(posY, QOverload<double>::of(&QDoubleSpinBox::valueChanged),
-				this, xformChanged);
-			connect(scX, QOverload<double>::of(&QDoubleSpinBox::valueChanged),
-				this, xformChanged);
-			connect(scY, QOverload<double>::of(&QDoubleSpinBox::valueChanged),
-				this, xformChanged);
-			connect(rot, QOverload<double>::of(&QDoubleSpinBox::valueChanged),
-				this, xformChanged);
-			connect(alignCb,
-				QOverload<int>::of(&QComboBox::currentIndexChanged),
-				this, [this, i](int) { onTransformChanged(i); });
-			connect(btCb,
-				QOverload<int>::of(&QComboBox::currentIndexChanged),
-				this, [this, i](int) { onTransformChanged(i); });
-			connect(bW, QOverload<double>::of(&QDoubleSpinBox::valueChanged),
-				this, xformChanged);
-			connect(bH, QOverload<double>::of(&QDoubleSpinBox::valueChanged),
-				this, xformChanged);
-			connect(bAlignCb,
-				QOverload<int>::of(&QComboBox::currentIndexChanged),
-				this, [this, i](int) { onTransformChanged(i); });
-
-			QPushButton *pasteBtn = new QPushButton("Paste from scene \u25BE");
-			pasteBtn->setToolTip(
-				"Copy this source's transform from another scene into this preset");
-			pasteBtn->setStyleSheet("QPushButton { font-size: 11px; padding: 4px 8px; }");
-			connect(pasteBtn, &QPushButton::clicked, this,
-				[this, i, pasteBtn]() {
-					QMenu menu;
-					struct Ctx { QMenu *m; } ctx{&menu};
-					shot_presets_for_each_source_scene(
-						[](const char *name, void *u) {
-							auto *c = (Ctx *)u;
-							c->m->addAction(
-								QString::fromUtf8(name));
-						}, &ctx);
-					if (menu.isEmpty()) {
-						menu.addAction("(no other scenes contain this source)")
-							->setEnabled(false);
-					}
-					QAction *chosen = menu.exec(pasteBtn->mapToGlobal(
-						QPoint(0, pasteBtn->height())));
-					if (chosen && chosen->isEnabled()) {
-						QByteArray name = chosen->text().toUtf8();
-						shot_presets_paste_from_scene(i, name.constData());
-						refreshUI();
-					}
-				});
-			epLayout->addWidget(pasteBtn);
-
-			QGridLayout *cropGrid = new QGridLayout();
-			cropGrid->setSpacing(4);
-			cropGrid->addWidget(new QLabel("Crop L:"), 0, 0);
-			QSpinBox *cL = new QSpinBox();
-			cL->setRange(0, 8192);
-			cL->setSingleStep(2);
-			cropGrid->addWidget(cL, 0, 1);
-			cropGrid->addWidget(new QLabel("T:"), 0, 2);
-			QSpinBox *cT = new QSpinBox();
-			cT->setRange(0, 8192);
-			cT->setSingleStep(2);
-			cropGrid->addWidget(cT, 0, 3);
-			cropGrid->addWidget(new QLabel("R:"), 1, 0);
-			QSpinBox *cR = new QSpinBox();
-			cR->setRange(0, 8192);
-			cR->setSingleStep(2);
-			cropGrid->addWidget(cR, 1, 1);
-			cropGrid->addWidget(new QLabel("B:"), 1, 2);
-			QSpinBox *cB = new QSpinBox();
-			cB->setRange(0, 8192);
-			cB->setSingleStep(2);
-			cropGrid->addWidget(cB, 1, 3);
-			epLayout->addLayout(cropGrid);
-
-			auto cropChanged = [this, i]() { onCropChanged(i); };
-			connect(cL, QOverload<int>::of(&QSpinBox::valueChanged),
-				this, cropChanged);
-			connect(cT, QOverload<int>::of(&QSpinBox::valueChanged),
-				this, cropChanged);
-			connect(cR, QOverload<int>::of(&QSpinBox::valueChanged),
-				this, cropChanged);
-			connect(cB, QOverload<int>::of(&QSpinBox::valueChanged),
-				this, cropChanged);
-
+			/* Edit panel intentionally minimal \u2014 framing is set by
+			 * dragging in OBS preview, then committed via the row's
+			 * Save button. The transform/crop/bounds spinboxes used
+			 * to live here but bloated the panel; backend still
+			 * stores all of those, just not editable from the dock. */
 			QPushButton *removeBtn = new QPushButton("Remove this shot");
 			removeBtn->setStyleSheet(
 				"QPushButton { font-size: 11px; padding: 4px 8px; color: #e88; }"
@@ -424,17 +267,15 @@ void ShotPresetsDock::refreshUI()
 			rowContainerLayout->addWidget(editPanel);
 			presetsLayout->addWidget(rowContainer);
 
-			PresetRow pr = {goBtn, cutBtn, capBtn, editBtn,
+			PresetRow pr = {goBtn, cutBtn, capBtn, editBtn, defBtn,
 					editPanel, pDur, transCb, nameEd,
-					cL, cT, cR, cB,
-					posX, posY, scX, scY, rot,
-					alignCb, btCb, bW, bH, bAlignCb,
 					removeBtn};
 			presetRows.append(pr);
 		}
 	}
 
 	/* Update button labels & spinbox values */
+	int defaultIdx = shot_presets_get_default_preset();
 	for (int i = 0; i < count && i < presetRows.size(); i++) {
 		const char *name = shot_presets_get_name(i);
 		bool active = shot_presets_is_active(i);
@@ -444,6 +285,17 @@ void ShotPresetsDock::refreshUI()
 		presetRows[i].goBtn->setText(label);
 		presetRows[i].goBtn->setEnabled(active);
 		presetRows[i].cutBtn->setEnabled(active);
+
+		/* Sync star button to backend default state */
+		QPushButton *db = presetRows[i].defaultBtn;
+		if (db) {
+			bool isDefault = (i == defaultIdx);
+			if (db->isChecked() != isDefault) {
+				QSignalBlocker blk(db);
+				db->setChecked(isDefault);
+			}
+			db->setText(QString::fromUtf8(isDefault ? "★" : "☆"));
+		}
 
 		int pDur = shot_presets_get_preset_duration(i);
 		QSpinBox *pd = presetRows[i].presetDurSpin;
@@ -472,55 +324,6 @@ void ShotPresetsDock::refreshUI()
 				ne->setText(actual);
 			}
 		}
-
-		int cl, ct, cr, cb;
-		shot_presets_get_crop(i, &cl, &ct, &cr, &cb);
-		QSpinBox *sL = presetRows[i].cropLSpin;
-		QSpinBox *sT = presetRows[i].cropTSpin;
-		QSpinBox *sR = presetRows[i].cropRSpin;
-		QSpinBox *sB = presetRows[i].cropBSpin;
-		if (sL && !sL->hasFocus() && sL->value() != cl) {
-			QSignalBlocker b(sL); sL->setValue(cl);
-		}
-		if (sT && !sT->hasFocus() && sT->value() != ct) {
-			QSignalBlocker b(sT); sT->setValue(ct);
-		}
-		if (sR && !sR->hasFocus() && sR->value() != cr) {
-			QSignalBlocker b(sR); sR->setValue(cr);
-		}
-		if (sB && !sB->hasFocus() && sB->value() != cb) {
-			QSignalBlocker b(sB); sB->setValue(cb);
-		}
-
-		/* Populate the transform fields without firing change
-		 * signals (QSignalBlocker) and without stealing keyboard
-		 * focus mid-edit (hasFocus check). */
-		shot_preset_transform_t xf;
-		shot_presets_get_transform(i, &xf);
-		auto setD = [](QDoubleSpinBox *w, double v) {
-			if (!w || w->hasFocus()) return;
-			if (w->value() == v) return;
-			QSignalBlocker b(w);
-			w->setValue(v);
-		};
-		auto setCb = [](QComboBox *w, int data) {
-			if (!w || w->hasFocus()) return;
-			int idx = w->findData(data);
-			if (idx < 0) idx = 0;
-			if (w->currentIndex() == idx) return;
-			QSignalBlocker b(w);
-			w->setCurrentIndex(idx);
-		};
-		setD(presetRows[i].posXSpin, xf.pos_x);
-		setD(presetRows[i].posYSpin, xf.pos_y);
-		setD(presetRows[i].scaleXSpin, xf.scale_x);
-		setD(presetRows[i].scaleYSpin, xf.scale_y);
-		setD(presetRows[i].rotSpin, xf.rotation);
-		setCb(presetRows[i].alignCb, (int)xf.alignment);
-		setCb(presetRows[i].boundsTypeCb, xf.bounds_type);
-		setD(presetRows[i].boundsWSpin, xf.bounds_x);
-		setD(presetRows[i].boundsHSpin, xf.bounds_y);
-		setCb(presetRows[i].boundsAlignCb, (int)xf.bounds_align);
 	}
 }
 
@@ -552,39 +355,9 @@ void ShotPresetsDock::onPresetDurationChanged(int index, int value)
 	shot_presets_set_preset_duration(index, value);
 }
 
-void ShotPresetsDock::onCropChanged(int index)
-{
-	if (index < 0 || index >= presetRows.size())
-		return;
-	int l = presetRows[index].cropLSpin->value();
-	int t = presetRows[index].cropTSpin->value();
-	int r = presetRows[index].cropRSpin->value();
-	int b = presetRows[index].cropBSpin->value();
-	shot_presets_set_crop(index, l, t, r, b);
-}
-
 void ShotPresetsDock::onTransitionChanged(int index, int type)
 {
 	shot_presets_set_transition(index, type);
-}
-
-void ShotPresetsDock::onTransformChanged(int index)
-{
-	if (index < 0 || index >= presetRows.size())
-		return;
-	PresetRow &r = presetRows[index];
-	shot_preset_transform_t xf = {0};
-	xf.pos_x    = (float)r.posXSpin->value();
-	xf.pos_y    = (float)r.posYSpin->value();
-	xf.scale_x  = (float)r.scaleXSpin->value();
-	xf.scale_y  = (float)r.scaleYSpin->value();
-	xf.rotation = (float)r.rotSpin->value();
-	xf.alignment    = (unsigned int)r.alignCb->currentData().toInt();
-	xf.bounds_type  = r.boundsTypeCb->currentData().toInt();
-	xf.bounds_x     = (float)r.boundsWSpin->value();
-	xf.bounds_y     = (float)r.boundsHSpin->value();
-	xf.bounds_align = (unsigned int)r.boundsAlignCb->currentData().toInt();
-	shot_presets_set_transform(index, &xf);
 }
 
 void ShotPresetsDock::onNameChanged(int index, const QString &name)
@@ -605,10 +378,41 @@ void ShotPresetsDock::onRemovePreset(int index)
 	refreshUI();
 }
 
+void ShotPresetsDock::onDefaultToggled(int index)
+{
+	/* Toggle: if this preset is already the default, clear it; otherwise
+	 * set it as the default. The backend stores at most one default per
+	 * scene, so setting overwrites any previous one. */
+	int current = shot_presets_get_default_preset();
+	shot_presets_set_default_preset(current == index ? -1 : index);
+	refreshUI();
+}
+
 void ShotPresetsDock::onCaptureClicked(int index)
 {
 	shot_presets_capture(index);
 	refreshUI();
+
+	/* Visual confirmation: flash the Save button green for ~700 ms so
+	 * the user knows the current preview framing was actually committed
+	 * to the scene's bucket. Reverts to the row's normal style afterwards. */
+	if (index < 0 || index >= presetRows.size())
+		return;
+	QPushButton *btn = presetRows[index].captureBtn;
+	if (!btn)
+		return;
+	const QString flashStyle =
+		"QPushButton { font-size: 11px; padding: 4px; "
+		"background: #2e8b3a; color: #fff; "
+		"border: 1px solid #4cc25f; }";
+	const QString restoreStyle =
+		"QPushButton { font-size: 11px; padding: 4px; }";
+	btn->setStyleSheet(flashStyle);
+	QPointer<QPushButton> guard(btn);
+	QTimer::singleShot(700, this, [guard, restoreStyle]() {
+		if (guard)
+			guard->setStyleSheet(restoreStyle);
+	});
 }
 
 void ShotPresetsDock::onDurationChanged(int value)

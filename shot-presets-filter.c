@@ -26,6 +26,8 @@ OBS_MODULE_USE_DEFAULT_LOCALE("obs-shot-presets", "en-US")
 /* ── Constants ───────────────────────────────────────────── */
 #define MAX_PRESETS 12
 #define PRESET_NAME_LEN 64
+#define SCENE_NAME_LEN 256
+#define MAX_SCENE_BUCKETS 32
 
 /* ── Data structures ─────────────────────────────────────── */
 
@@ -44,6 +46,23 @@ struct shot_preset {
 	int transition_type;   /* 0 = move (animated), 1 = cut (instant) */
 };
 
+/* Per-scene bucket of presets. Each scene the filter is active in gets
+ * its own bucket so a single source filter can drive different framings
+ * in different scenes (e.g. wide-cam used in both Wide and Guest scenes).
+ * scene_name="" is the legacy/default bucket used as a migration template
+ * and as a fallback before any scene-change event has fired. */
+struct shot_preset_bucket {
+	char scene_name[SCENE_NAME_LEN];
+	struct shot_preset presets[MAX_PRESETS];
+	int num_presets;
+	int current_preset;        /* last activated preset, -1 = none */
+	int default_preset;        /* scene's default framing on activation,
+	                             * -1 = none (falls back to current_preset
+	                             * then preset 0). Set via dock star
+	                             * toggle. */
+	bool user_activated;       /* user has clicked at least once in this scene */
+};
+
 struct shot_presets_data {
 	obs_source_t *source;
 
@@ -57,9 +76,19 @@ struct shot_presets_data {
 	char enabled_scenes[MAX_ENABLED_SCENES][256];
 	int num_enabled_scenes;
 
-	struct shot_preset presets[MAX_PRESETS];
-	int num_presets;
-	int current_preset;       /* last activated preset index, -1 = none */
+	/* Per-scene preset buckets. Resolved by g_active_scene_name; auto-
+	 * created lazily when a scene with the parent source first activates
+	 * and a write or query touches the active bucket. */
+	struct shot_preset_bucket buckets[MAX_SCENE_BUCKETS];
+	int num_buckets;
+
+	/* Migration template: populated from a legacy flat "presets" array on
+	 * load. When a new scene's bucket is auto-created, it's seeded from
+	 * this template so old data isn't lost. has_legacy_template clears
+	 * once the template has been used at least once. */
+	struct shot_preset legacy_presets[MAX_PRESETS];
+	int legacy_num_presets;
+	bool has_legacy_template;
 
 	/* Animation */
 	bool animating;
@@ -68,12 +97,10 @@ struct shot_presets_data {
 	struct shot_preset from;  /* captured at animation start */
 	struct shot_preset to;    /* target */
 
-	/* Live-edit-while-parked: once the user has explicitly activated a
-	 * preset (click / hotkey / cut), any subsequent sceneitem transform
-	 * edits get captured back into that preset so the user can refine
-	 * framing in OBS's preview and have it save automatically. Stays
-	 * false at startup so loaded presets aren't trampled. */
-	bool user_activated;
+	/* Live-edit-while-parked: sync_dirty/sync_debounce are transient
+	 * timing state for the currently active bucket. user_activated lives
+	 * on each bucket so engaging in scene A doesn't auto-capture in
+	 * scene B before the user clicks there too. */
 	float sync_debounce;      /* seconds since last disk write */
 	bool sync_dirty;          /* unsaved sceneitem change pending */
 
@@ -82,7 +109,10 @@ struct shot_presets_data {
 	int easing_type;
 	int easing_function;
 
-	/* Hotkeys */
+	/* Hotkeys: registered MAX_PRESETS times at create. Callback resolves
+	 * to the active bucket and invokes the preset at that slot, so a
+	 * single keybinding works across all scenes (preset 1 in scene Wide
+	 * vs preset 1 in scene Guest both fire on the same key). */
 	obs_hotkey_id hotkeys[MAX_PRESETS];
 
 	/* Fade (cross-dissolve) transition state.
@@ -161,6 +191,11 @@ static struct instance_entry g_instances[MAX_INSTANCES];
 static int g_instance_count = 0;
 static struct shot_presets_data *g_active_instance = NULL;
 
+/* Name of the scene OBS reports as current. Set by
+ * update_active_for_current_scene; consulted by active_bucket() to pick
+ * which bucket each instance's preset operations should target. */
+static char g_active_scene_name[SCENE_NAME_LEN] = "";
+
 /* forward declaration */
 void go_to_preset(struct shot_presets_data *d, int index);
 void cut_to_preset(struct shot_presets_data *d, int index);
@@ -173,6 +208,78 @@ static void apply_transform(struct shot_presets_data *d,
                             struct shot_preset *to, float t);
 static void hotkey_cb(void *data, obs_hotkey_id id, obs_hotkey_t *hotkey,
                       bool pressed);
+
+/* ── Bucket helpers ─────────────────────────────────────────
+ * Each filter instance stores presets in per-scene buckets. The "active"
+ * bucket is whichever one matches g_active_scene_name. Auto-created on
+ * first access so adding a preset in a never-visited scene Just Works. */
+
+static struct shot_preset_bucket *find_bucket(struct shot_presets_data *d,
+                                               const char *name)
+{
+	if (!name)
+		name = "";
+	for (int i = 0; i < d->num_buckets; i++) {
+		if (strcmp(d->buckets[i].scene_name, name) == 0)
+			return &d->buckets[i];
+	}
+	return NULL;
+}
+
+/* Seed a freshly-created bucket from the legacy template if one exists.
+ * Used so that a save loaded from before per-scene buckets keeps its
+ * presets when the user first visits a scene with the filter source. */
+static void seed_bucket_from_legacy(struct shot_presets_data *d,
+                                     struct shot_preset_bucket *b)
+{
+	if (!d->has_legacy_template || d->legacy_num_presets <= 0)
+		return;
+	int n = d->legacy_num_presets;
+	if (n > MAX_PRESETS) n = MAX_PRESETS;
+	for (int i = 0; i < n; i++)
+		b->presets[i] = d->legacy_presets[i];
+	b->num_presets = n;
+}
+
+static struct shot_preset_bucket *get_or_create_bucket(
+	struct shot_presets_data *d, const char *name)
+{
+	struct shot_preset_bucket *b = find_bucket(d, name);
+	if (b)
+		return b;
+	if (d->num_buckets >= MAX_SCENE_BUCKETS)
+		return NULL;
+	b = &d->buckets[d->num_buckets++];
+	memset(b, 0, sizeof(*b));
+	snprintf(b->scene_name, sizeof(b->scene_name), "%s",
+	         name ? name : "");
+	b->current_preset = -1;
+	b->default_preset = -1;
+	b->user_activated = false;
+	seed_bucket_from_legacy(d, b);
+	return b;
+}
+
+/* Bucket for the current OBS scene. Auto-creates if writing to a scene
+ * that hasn't been touched before. Returns NULL only if MAX_SCENE_BUCKETS
+ * is exceeded — callers must guard. */
+static struct shot_preset_bucket *active_bucket(struct shot_presets_data *d)
+{
+	if (!d)
+		return NULL;
+	return get_or_create_bucket(d, g_active_scene_name);
+}
+
+/* Read-only variant: returns the active bucket if it exists, else NULL.
+ * Use for queries that should report "no presets" rather than auto-create
+ * a bucket as a side effect. */
+static struct shot_preset_bucket *peek_active_bucket(
+	struct shot_presets_data *d)
+{
+	if (!d)
+		return NULL;
+	return find_bucket(d, g_active_scene_name);
+}
 
 /* ── Shared API for the dock ─────────────────────────────── */
 
@@ -205,24 +312,31 @@ void shot_presets_cut(int preset_index)
 
 int shot_presets_get_count(void)
 {
-	return g_active_instance ? g_active_instance->num_presets : 0;
+	if (!g_active_instance)
+		return 0;
+	struct shot_preset_bucket *b = peek_active_bucket(g_active_instance);
+	return b ? b->num_presets : 0;
 }
 
 const char *shot_presets_get_name(int index)
 {
-	if (!g_active_instance || index < 0 ||
-	    index >= g_active_instance->num_presets)
+	if (!g_active_instance)
 		return "";
-	return g_active_instance->presets[index].name;
+	struct shot_preset_bucket *b = peek_active_bucket(g_active_instance);
+	if (!b || index < 0 || index >= b->num_presets)
+		return "";
+	return b->presets[index].name;
 }
 
 void shot_presets_set_name(int index, const char *name)
 {
-	if (!g_active_instance || index < 0 ||
-	    index >= g_active_instance->num_presets || !name)
+	if (!g_active_instance || !name)
 		return;
 	struct shot_presets_data *d = g_active_instance;
-	snprintf(d->presets[index].name, PRESET_NAME_LEN, "%s",
+	struct shot_preset_bucket *b = active_bucket(d);
+	if (!b || index < 0 || index >= b->num_presets)
+		return;
+	snprintf(b->presets[index].name, PRESET_NAME_LEN, "%s",
 	         *name ? name : "Untitled");
 	obs_data_t *settings = obs_source_get_settings(d->source);
 	save_presets(d, settings);
@@ -231,10 +345,12 @@ void shot_presets_set_name(int index, const char *name)
 
 int shot_presets_is_active(int index)
 {
-	if (!g_active_instance || index < 0 ||
-	    index >= g_active_instance->num_presets)
+	if (!g_active_instance)
 		return 0;
-	return g_active_instance->presets[index].active ? 1 : 0;
+	struct shot_preset_bucket *b = peek_active_bucket(g_active_instance);
+	if (!b || index < 0 || index >= b->num_presets)
+		return 0;
+	return b->presets[index].active ? 1 : 0;
 }
 
 int shot_presets_get_duration(void)
@@ -253,19 +369,21 @@ void shot_presets_set_duration(int ms)
 
 void shot_presets_capture(int preset_index)
 {
-	if (!g_active_instance || preset_index < 0 ||
-	    preset_index >= g_active_instance->num_presets)
+	if (!g_active_instance)
 		return;
 	struct shot_presets_data *d = g_active_instance;
 	bind_home_scene_if_needed(d);
-	if (capture_transform(d, &d->presets[preset_index])) {
-		d->presets[preset_index].active = true;
+	struct shot_preset_bucket *bk = active_bucket(d);
+	if (!bk || preset_index < 0 || preset_index >= bk->num_presets)
+		return;
+	if (capture_transform(d, &bk->presets[preset_index])) {
+		bk->presets[preset_index].active = true;
 		/* Route subsequent live-edit-while-parked writes into THIS
 		 * slot, not whichever preset was parked before the capture.
 		 * Otherwise a drag right after capturing Medium would sync
 		 * into Wide because current_preset never moved. */
-		d->current_preset = preset_index;
-		d->user_activated = true;
+		bk->current_preset = preset_index;
+		bk->user_activated = true;
 		d->animating = false;
 		d->sync_dirty = false;
 		d->sync_debounce = 0.0f;
@@ -277,56 +395,67 @@ void shot_presets_capture(int preset_index)
 
 int shot_presets_get_preset_duration(int index)
 {
-	if (!g_active_instance || index < 0 ||
-	    index >= g_active_instance->num_presets)
+	if (!g_active_instance)
 		return 0;
-	return g_active_instance->presets[index].duration_ms;
+	struct shot_preset_bucket *b = peek_active_bucket(g_active_instance);
+	if (!b || index < 0 || index >= b->num_presets)
+		return 0;
+	return b->presets[index].duration_ms;
 }
 
 void shot_presets_set_preset_duration(int index, int ms)
 {
-	if (!g_active_instance || index < 0 ||
-	    index >= g_active_instance->num_presets)
+	if (!g_active_instance)
 		return;
-	g_active_instance->presets[index].duration_ms = ms;
-	obs_data_t *settings = obs_source_get_settings(g_active_instance->source);
-	save_presets(g_active_instance, settings);
+	struct shot_presets_data *d = g_active_instance;
+	struct shot_preset_bucket *b = active_bucket(d);
+	if (!b || index < 0 || index >= b->num_presets)
+		return;
+	b->presets[index].duration_ms = ms;
+	obs_data_t *settings = obs_source_get_settings(d->source);
+	save_presets(d, settings);
 	obs_data_release(settings);
 }
 
-void shot_presets_get_crop(int index, int *l, int *t, int *r, int *b)
+void shot_presets_get_crop(int index, int *l, int *t, int *r, int *bot)
 {
-	if (!g_active_instance || index < 0 ||
-	    index >= g_active_instance->num_presets) {
-		if (l) *l = 0;
-		if (t) *t = 0;
-		if (r) *r = 0;
-		if (b) *b = 0;
+	if (l) *l = 0;
+	if (t) *t = 0;
+	if (r) *r = 0;
+	if (bot) *bot = 0;
+	if (!g_active_instance)
 		return;
-	}
-	struct shot_preset *p = &g_active_instance->presets[index];
+	struct shot_preset_bucket *bk = peek_active_bucket(g_active_instance);
+	if (!bk || index < 0 || index >= bk->num_presets)
+		return;
+	struct shot_preset *p = &bk->presets[index];
 	if (l) *l = p->crop_left;
 	if (t) *t = p->crop_top;
 	if (r) *r = p->crop_right;
-	if (b) *b = p->crop_bottom;
+	if (bot) *bot = p->crop_bottom;
 }
 
 int shot_presets_get_transition(int index)
 {
-	if (!g_active_instance || index < 0 ||
-	    index >= g_active_instance->num_presets)
+	if (!g_active_instance)
 		return 0;
-	return g_active_instance->presets[index].transition_type;
+	struct shot_preset_bucket *b = peek_active_bucket(g_active_instance);
+	if (!b || index < 0 || index >= b->num_presets)
+		return 0;
+	return b->presets[index].transition_type;
 }
 
 void shot_presets_set_transition(int index, int type)
 {
-	if (!g_active_instance || index < 0 ||
-	    index >= g_active_instance->num_presets)
+	if (!g_active_instance)
 		return;
-	g_active_instance->presets[index].transition_type = type;
-	obs_data_t *settings = obs_source_get_settings(g_active_instance->source);
-	save_presets(g_active_instance, settings);
+	struct shot_presets_data *d = g_active_instance;
+	struct shot_preset_bucket *b = active_bucket(d);
+	if (!b || index < 0 || index >= b->num_presets)
+		return;
+	b->presets[index].transition_type = type;
+	obs_data_t *settings = obs_source_get_settings(d->source);
+	save_presets(d, settings);
 	obs_data_release(settings);
 }
 
@@ -335,32 +464,59 @@ int shot_presets_has_active(void)
 	return g_active_instance ? 1 : 0;
 }
 
+int shot_presets_get_default_preset(void)
+{
+	if (!g_active_instance)
+		return -1;
+	struct shot_preset_bucket *b = peek_active_bucket(g_active_instance);
+	return b ? b->default_preset : -1;
+}
+
+void shot_presets_set_default_preset(int index)
+{
+	if (!g_active_instance)
+		return;
+	struct shot_presets_data *d = g_active_instance;
+	struct shot_preset_bucket *b = active_bucket(d);
+	if (!b)
+		return;
+	if (index < -1 || index >= b->num_presets)
+		return;
+	if (b->default_preset == index)
+		return; /* no change */
+	b->default_preset = index;
+	obs_data_t *settings = obs_source_get_settings(d->source);
+	save_presets(d, settings);
+	obs_data_release(settings);
+	blog(LOG_INFO,
+	     "[Shot Presets] scene '%s' default_preset = %d",
+	     b->scene_name, index);
+}
+
 void shot_presets_add_preset(const char *name)
 {
 	if (!g_active_instance)
 		return;
 	struct shot_presets_data *d = g_active_instance;
-	if (d->num_presets >= MAX_PRESETS)
+	struct shot_preset_bucket *bk = active_bucket(d);
+	if (!bk || bk->num_presets >= MAX_PRESETS)
 		return;
 
-	struct shot_preset *p = &d->presets[d->num_presets];
+	struct shot_preset *p = &bk->presets[bk->num_presets];
 	memset(p, 0, sizeof(*p));
 	if (name && *name)
 		snprintf(p->name, PRESET_NAME_LEN, "%s", name);
 	else
-		snprintf(p->name, PRESET_NAME_LEN, "Shot %d", d->num_presets + 1);
+		snprintf(p->name, PRESET_NAME_LEN, "Shot %d",
+		         bk->num_presets + 1);
 	p->scale_x = 1.0f;
 	p->scale_y = 1.0f;
-	d->num_presets++;
+	bk->num_presets++;
 
-	struct dstr hk_name = {0};
-	struct dstr hk_desc = {0};
-	dstr_printf(&hk_name, "shot_preset_%d", d->num_presets - 1);
-	dstr_printf(&hk_desc, "Shot Preset: %s", p->name);
-	d->hotkeys[d->num_presets - 1] = obs_hotkey_register_source(
-		d->source, hk_name.array, hk_desc.array, hotkey_cb, d);
-	dstr_free(&hk_name);
-	dstr_free(&hk_desc);
+	/* Hotkeys are registered MAX_PRESETS times at filter_create with
+	 * generic names — the callback resolves to the active bucket and
+	 * the same key works across scenes for the same slot. No new
+	 * registration needed when adding presets. */
 
 	obs_data_t *settings = obs_source_get_settings(d->source);
 	save_presets(d, settings);
@@ -372,12 +528,21 @@ void shot_presets_remove_preset(int index)
 	if (!g_active_instance)
 		return;
 	struct shot_presets_data *d = g_active_instance;
-	if (index < 0 || index >= d->num_presets)
+	struct shot_preset_bucket *bk = active_bucket(d);
+	if (!bk || index < 0 || index >= bk->num_presets)
 		return;
-	for (int i = index; i < d->num_presets - 1; i++) {
-		d->presets[i] = d->presets[i + 1];
+	for (int i = index; i < bk->num_presets - 1; i++) {
+		bk->presets[i] = bk->presets[i + 1];
 	}
-	d->num_presets--;
+	bk->num_presets--;
+	if (bk->current_preset == index)
+		bk->current_preset = -1;
+	else if (bk->current_preset > index)
+		bk->current_preset--;
+	if (bk->default_preset == index)
+		bk->default_preset = -1;
+	else if (bk->default_preset > index)
+		bk->default_preset--;
 	obs_data_t *settings = obs_source_get_settings(d->source);
 	save_presets(d, settings);
 	obs_data_release(settings);
@@ -409,10 +574,12 @@ void shot_presets_for_each_source_scene(shot_presets_scene_cb cb, void *user)
 
 void shot_presets_paste_from_scene(int preset_index, const char *scene_name)
 {
-	if (!g_active_instance || !scene_name || preset_index < 0 ||
-	    preset_index >= g_active_instance->num_presets)
+	if (!g_active_instance || !scene_name)
 		return;
 	struct shot_presets_data *d = g_active_instance;
+	struct shot_preset_bucket *bk = active_bucket(d);
+	if (!bk || preset_index < 0 || preset_index >= bk->num_presets)
+		return;
 	obs_source_t *parent = obs_filter_get_parent(d->source);
 	if (!parent)
 		return;
@@ -439,7 +606,7 @@ void shot_presets_paste_from_scene(int preset_index, const char *scene_name)
 	}
 
 	if (item) {
-		struct shot_preset *p = &d->presets[preset_index];
+		struct shot_preset *p = &bk->presets[preset_index];
 		struct vec2 pos, scale, bounds;
 		struct obs_sceneitem_crop crop;
 		obs_sceneitem_get_pos(item, &pos);
@@ -486,10 +653,12 @@ void shot_presets_paste_from_scene(int preset_index, const char *scene_name)
 
 int shot_presets_get_transform(int index, shot_preset_transform_t *out)
 {
-	if (!g_active_instance || !out || index < 0 ||
-	    index >= g_active_instance->num_presets)
+	if (!g_active_instance || !out)
 		return 0;
-	struct shot_preset *p = &g_active_instance->presets[index];
+	struct shot_preset_bucket *bk = peek_active_bucket(g_active_instance);
+	if (!bk || index < 0 || index >= bk->num_presets)
+		return 0;
+	struct shot_preset *p = &bk->presets[index];
 	out->pos_x = p->pos_x;
 	out->pos_y = p->pos_y;
 	out->scale_x = p->scale_x;
@@ -505,11 +674,13 @@ int shot_presets_get_transform(int index, shot_preset_transform_t *out)
 
 void shot_presets_set_transform(int index, const shot_preset_transform_t *in)
 {
-	if (!g_active_instance || !in || index < 0 ||
-	    index >= g_active_instance->num_presets)
+	if (!g_active_instance || !in)
 		return;
 	struct shot_presets_data *d = g_active_instance;
-	struct shot_preset *p = &d->presets[index];
+	struct shot_preset_bucket *bk = active_bucket(d);
+	if (!bk || index < 0 || index >= bk->num_presets)
+		return;
+	struct shot_preset *p = &bk->presets[index];
 
 	/* Preserve crop — dock has a separate control path for that. */
 	int cl = p->crop_left, ct = p->crop_top;
@@ -545,11 +716,13 @@ void shot_presets_set_transform(int index, const shot_preset_transform_t *in)
 
 void shot_presets_set_crop(int index, int l, int t, int r, int b)
 {
-	if (!g_active_instance || index < 0 ||
-	    index >= g_active_instance->num_presets)
+	if (!g_active_instance)
 		return;
 	struct shot_presets_data *d = g_active_instance;
-	struct shot_preset *p = &d->presets[index];
+	struct shot_preset_bucket *bk = active_bucket(d);
+	if (!bk || index < 0 || index >= bk->num_presets)
+		return;
+	struct shot_preset *p = &bk->presets[index];
 
 	blog(LOG_INFO,
 	     "[Shot Presets] set_crop(%d '%s') l=%d t=%d r=%d b=%d "
@@ -865,13 +1038,20 @@ static void normalize_preset_to_none(struct shot_preset *p,
 
 void go_to_preset(struct shot_presets_data *d, int index)
 {
-	if (index < 0 || index >= d->num_presets) {
+	struct shot_preset_bucket *bk = active_bucket(d);
+	if (!bk) {
 		blog(LOG_WARNING,
-		     "[Shot Presets] go_to: bad index %d (num_presets=%d)",
-		     index, d->num_presets);
+		     "[Shot Presets] go_to: no bucket available for scene '%s'",
+		     g_active_scene_name);
 		return;
 	}
-	if (!d->presets[index].active) {
+	if (index < 0 || index >= bk->num_presets) {
+		blog(LOG_WARNING,
+		     "[Shot Presets] go_to: bad index %d (num_presets=%d, scene='%s')",
+		     index, bk->num_presets, bk->scene_name);
+		return;
+	}
+	if (!bk->presets[index].active) {
 		/* First click on an empty slot seeds it from the live
 		 * sceneitem transform instead of silently refusing. Without
 		 * this, the click is a no-op but the user thinks they
@@ -879,18 +1059,18 @@ void go_to_preset(struct shot_presets_data *d, int index)
 		 * whichever preset was *previously* parked (because
 		 * current_preset never moves). Treat first click as:
 		 * capture live → mark active → cut (no animation). */
-		if (!capture_transform(d, &d->presets[index])) {
+		if (!capture_transform(d, &bk->presets[index])) {
 			blog(LOG_WARNING,
 			     "[Shot Presets] go_to: preset %d ('%s') not active and "
 			     "capture_transform failed — source missing from scene?",
-			     index, d->presets[index].name);
+			     index, bk->presets[index].name);
 			return;
 		}
-		d->presets[index].active = true;
+		bk->presets[index].active = true;
 		blog(LOG_INFO,
 		     "[Shot Presets] go_to: seeded empty preset %d '%s' from "
 		     "current sceneitem",
-		     index, d->presets[index].name);
+		     index, bk->presets[index].name);
 		cut_to_preset(d, index);
 		obs_data_t *settings = obs_source_get_settings(d->source);
 		save_presets(d, settings);
@@ -905,18 +1085,18 @@ void go_to_preset(struct shot_presets_data *d, int index)
 		return;
 	}
 
-	d->to = d->presets[index];
-	d->current_preset = index;
-	d->user_activated = true;
+	d->to = bk->presets[index];
+	bk->current_preset = index;
+	bk->user_activated = true;
 	d->sync_dirty = false;
 	d->running_duration = 0.0f;
-	d->active_duration_ms = d->presets[index].duration_ms > 0
-		? d->presets[index].duration_ms
+	d->active_duration_ms = bk->presets[index].duration_ms > 0
+		? bk->presets[index].duration_ms
 		: d->duration_ms;
 	if (d->active_duration_ms < 50)
 		d->active_duration_ms = 400;
 
-	bool is_fade = (d->presets[index].transition_type == SHOT_TRANSITION_FADE);
+	bool is_fade = (bk->presets[index].transition_type == SHOT_TRANSITION_FADE);
 	d->fade_enabled = false;
 	d->fade_t = 0.0f;
 
@@ -941,7 +1121,7 @@ void go_to_preset(struct shot_presets_data *d, int index)
 				obs_sceneitem_get_box_transform(item, &d->fade_from_mtx);
 
 				/* (2) apply `to` temporarily, read its matrix. */
-				struct shot_preset to_tmp = d->presets[index];
+				struct shot_preset to_tmp = bk->presets[index];
 				apply_transform(d, &to_tmp, &to_tmp, 1.0f);
 				obs_sceneitem_force_update_transform(item);
 				obs_sceneitem_get_box_transform(item, &d->fade_to_mtx);
@@ -1018,7 +1198,7 @@ void go_to_preset(struct shot_presets_data *d, int index)
 	     "bt=%d bnds=(%.0f,%.0f) ba=%u al=%u   "
 	     "to pos=(%.1f,%.1f) scale=(%.2f,%.2f) crop=(%d,%d,%d,%d) "
 	     "bt=%d bnds=(%.0f,%.0f) ba=%u al=%u",
-	     d->presets[index].name, d->active_duration_ms,
+	     bk->presets[index].name, d->active_duration_ms,
 	     d->from.pos_x, d->from.pos_y, d->from.scale_x, d->from.scale_y,
 	     d->from.crop_left, d->from.crop_top, d->from.crop_right, d->from.crop_bottom,
 	     (int)d->from.bounds_type, d->from.bounds_x, d->from.bounds_y,
@@ -1035,13 +1215,14 @@ void go_to_preset(struct shot_presets_data *d, int index)
  * stale sceneitem transform that OBS had saved on the item. */
 static void snap_to_preset_silent(struct shot_presets_data *d, int index)
 {
-	if (index < 0 || index >= d->num_presets)
+	struct shot_preset_bucket *bk = active_bucket(d);
+	if (!bk || index < 0 || index >= bk->num_presets)
 		return;
-	if (!d->presets[index].active)
+	if (!bk->presets[index].active)
 		return;
 
 	d->animating = false;
-	struct shot_preset target = d->presets[index];
+	struct shot_preset target = bk->presets[index];
 
 	obs_source_t *parent = obs_filter_get_parent(d->source);
 	if (parent) {
@@ -1055,16 +1236,17 @@ static void snap_to_preset_silent(struct shot_presets_data *d, int index)
 
 void cut_to_preset(struct shot_presets_data *d, int index)
 {
-	if (index < 0 || index >= d->num_presets)
+	struct shot_preset_bucket *bk = active_bucket(d);
+	if (!bk || index < 0 || index >= bk->num_presets)
 		return;
-	if (!d->presets[index].active)
+	if (!bk->presets[index].active)
 		return;
 
 	d->animating = false;
-	d->current_preset = index;
-	d->user_activated = true;
+	bk->current_preset = index;
+	bk->user_activated = true;
 	d->sync_dirty = false;
-	struct shot_preset target = d->presets[index];
+	struct shot_preset target = bk->presets[index];
 
 	obs_source_t *parent = obs_filter_get_parent(d->source);
 	if (parent) {
@@ -1097,7 +1279,10 @@ static void hotkey_cb(void *data, obs_hotkey_id id, obs_hotkey_t *hotkey,
 	if (!pressed)
 		return;
 	struct shot_presets_data *d = data;
-	for (int i = 0; i < d->num_presets; i++) {
+	/* Hotkeys are registered MAX_PRESETS times in slot order; resolve
+	 * id → slot, then dispatch to the active bucket so the same key works
+	 * across scenes. go_to_preset itself looks up active_bucket(d). */
+	for (int i = 0; i < MAX_PRESETS; i++) {
 		if (d->hotkeys[i] == id) {
 			go_to_preset(d, i);
 			return;
@@ -1107,35 +1292,60 @@ static void hotkey_cb(void *data, obs_hotkey_id id, obs_hotkey_t *hotkey,
 
 /* ── Save presets to obs_data ────────────────────────────── */
 
+/* Serialize one preset slot. Used by both the per-bucket preset array
+ * and the legacy migration template (kept on disk in case a downgrade
+ * needs to read it). */
+static void save_one_preset(obs_data_t *obj, const struct shot_preset *p)
+{
+	obs_data_set_string(obj, "name", p->name);
+	obs_data_set_bool(obj, "active", p->active);
+	obs_data_set_double(obj, "pos_x", p->pos_x);
+	obs_data_set_double(obj, "pos_y", p->pos_y);
+	obs_data_set_double(obj, "scale_x", p->scale_x);
+	obs_data_set_double(obj, "scale_y", p->scale_y);
+	obs_data_set_double(obj, "rotation", p->rotation);
+	obs_data_set_int(obj, "crop_left", p->crop_left);
+	obs_data_set_int(obj, "crop_top", p->crop_top);
+	obs_data_set_int(obj, "crop_right", p->crop_right);
+	obs_data_set_int(obj, "crop_bottom", p->crop_bottom);
+	obs_data_set_double(obj, "bounds_x", p->bounds_x);
+	obs_data_set_double(obj, "bounds_y", p->bounds_y);
+	obs_data_set_int(obj, "bounds_type", (int)p->bounds_type);
+	obs_data_set_int(obj, "bounds_align", (int)p->bounds_align);
+	obs_data_set_int(obj, "alignment", (int)p->alignment);
+	obs_data_set_int(obj, "preset_duration_ms", p->duration_ms);
+	obs_data_set_int(obj, "transition_type", p->transition_type);
+}
+
 void save_presets(struct shot_presets_data *d, obs_data_t *settings)
 {
-	obs_data_array_t *arr = obs_data_array_create();
-	for (int i = 0; i < d->num_presets; i++) {
-		struct shot_preset *p = &d->presets[i];
-		obs_data_t *obj = obs_data_create();
-		obs_data_set_string(obj, "name", p->name);
-		obs_data_set_bool(obj, "active", p->active);
-		obs_data_set_double(obj, "pos_x", p->pos_x);
-		obs_data_set_double(obj, "pos_y", p->pos_y);
-		obs_data_set_double(obj, "scale_x", p->scale_x);
-		obs_data_set_double(obj, "scale_y", p->scale_y);
-		obs_data_set_double(obj, "rotation", p->rotation);
-		obs_data_set_int(obj, "crop_left", p->crop_left);
-		obs_data_set_int(obj, "crop_top", p->crop_top);
-		obs_data_set_int(obj, "crop_right", p->crop_right);
-		obs_data_set_int(obj, "crop_bottom", p->crop_bottom);
-		obs_data_set_double(obj, "bounds_x", p->bounds_x);
-		obs_data_set_double(obj, "bounds_y", p->bounds_y);
-		obs_data_set_int(obj, "bounds_type", (int)p->bounds_type);
-		obs_data_set_int(obj, "bounds_align", (int)p->bounds_align);
-		obs_data_set_int(obj, "alignment", (int)p->alignment);
-		obs_data_set_int(obj, "preset_duration_ms", p->duration_ms);
-		obs_data_set_int(obj, "transition_type", p->transition_type);
-		obs_data_array_push_back(arr, obj);
-		obs_data_release(obj);
+	/* Per-scene buckets — primary persistence format. */
+	obs_data_array_t *barr = obs_data_array_create();
+	for (int i = 0; i < d->num_buckets; i++) {
+		struct shot_preset_bucket *bk = &d->buckets[i];
+		obs_data_t *bobj = obs_data_create();
+		obs_data_set_string(bobj, "scene_name", bk->scene_name);
+		obs_data_set_int(bobj, "current_preset", bk->current_preset);
+		obs_data_set_int(bobj, "default_preset", bk->default_preset);
+		obs_data_array_t *parr = obs_data_array_create();
+		for (int j = 0; j < bk->num_presets; j++) {
+			obs_data_t *pobj = obs_data_create();
+			save_one_preset(pobj, &bk->presets[j]);
+			obs_data_array_push_back(parr, pobj);
+			obs_data_release(pobj);
+		}
+		obs_data_set_array(bobj, "presets", parr);
+		obs_data_array_release(parr);
+		obs_data_array_push_back(barr, bobj);
+		obs_data_release(bobj);
 	}
-	obs_data_set_array(settings, "presets", arr);
-	obs_data_array_release(arr);
+	obs_data_set_array(settings, "scene_buckets", barr);
+	obs_data_array_release(barr);
+
+	/* Strip the legacy flat "presets" key — older versions read from it
+	 * and would clobber the buckets on load. Leaving it stale risks data
+	 * divergence if someone downgrades. */
+	obs_data_erase(settings, "presets");
 
 	/* Persist enabled scenes both as an explicit array (primary record)
 	 * and as scene_enabled_<name> bools (so the properties-dialog
@@ -1151,6 +1361,34 @@ void save_presets(struct shot_presets_data *d, obs_data_t *settings)
 	obs_data_array_release(sarr);
 }
 
+/* Load a single preset slot from obs_data. Inverse of save_one_preset. */
+static void load_one_preset(obs_data_t *obj, struct shot_preset *p)
+{
+	const char *name = obs_data_get_string(obj, "name");
+	snprintf(p->name, PRESET_NAME_LEN, "%s",
+	         name && *name ? name : "Untitled");
+	p->active     = obs_data_get_bool(obj, "active");
+	p->pos_x      = (float)obs_data_get_double(obj, "pos_x");
+	p->pos_y      = (float)obs_data_get_double(obj, "pos_y");
+	p->scale_x    = (float)obs_data_get_double(obj, "scale_x");
+	p->scale_y    = (float)obs_data_get_double(obj, "scale_y");
+	p->rotation   = (float)obs_data_get_double(obj, "rotation");
+	p->crop_left  = (int)obs_data_get_int(obj, "crop_left");
+	p->crop_top   = (int)obs_data_get_int(obj, "crop_top");
+	p->crop_right = (int)obs_data_get_int(obj, "crop_right");
+	p->crop_bottom= (int)obs_data_get_int(obj, "crop_bottom");
+	p->bounds_x   = (float)obs_data_get_double(obj, "bounds_x");
+	p->bounds_y   = (float)obs_data_get_double(obj, "bounds_y");
+	p->bounds_type = (int)obs_data_get_int(obj, "bounds_type");
+	p->bounds_align= (uint32_t)obs_data_get_int(obj, "bounds_align");
+	/* Older saves lacked alignment; default to OBS_ALIGN_TOP|LEFT (5) */
+	p->alignment = obs_data_has_user_value(obj, "alignment")
+		? (uint32_t)obs_data_get_int(obj, "alignment")
+		: (OBS_ALIGN_TOP | OBS_ALIGN_LEFT);
+	p->duration_ms = (int)obs_data_get_int(obj, "preset_duration_ms");
+	p->transition_type = (int)obs_data_get_int(obj, "transition_type");
+}
+
 /* ── Filter callbacks ────────────────────────────────────── */
 
 static const char *filter_get_name(void *unused)
@@ -1163,7 +1401,6 @@ static void *filter_create(obs_data_t *settings, obs_source_t *source)
 {
 	struct shot_presets_data *d = bzalloc(sizeof(*d));
 	d->source = source;
-	d->current_preset = -1;
 
 	obs_enter_graphics();
 	char *err = NULL;
@@ -1225,69 +1462,108 @@ static void *filter_create(obs_data_t *settings, obs_source_t *source)
 		}
 	}
 
-	/* Load saved presets */
-	obs_data_array_t *arr = obs_data_get_array(settings, "presets");
-	if (arr) {
-		size_t count = obs_data_array_count(arr);
-		if (count > MAX_PRESETS)
-			count = MAX_PRESETS;
-		for (size_t i = 0; i < count; i++) {
-			obs_data_t *obj = obs_data_array_item(arr, i);
-			struct shot_preset *p = &d->presets[i];
-			const char *name = obs_data_get_string(obj, "name");
-			snprintf(p->name, PRESET_NAME_LEN, "%s",
-			         name && *name ? name : "Untitled");
-			p->active     = obs_data_get_bool(obj, "active");
-			p->pos_x      = (float)obs_data_get_double(obj, "pos_x");
-			p->pos_y      = (float)obs_data_get_double(obj, "pos_y");
-			p->scale_x    = (float)obs_data_get_double(obj, "scale_x");
-			p->scale_y    = (float)obs_data_get_double(obj, "scale_y");
-			p->rotation   = (float)obs_data_get_double(obj, "rotation");
-			p->crop_left  = (int)obs_data_get_int(obj, "crop_left");
-			p->crop_top   = (int)obs_data_get_int(obj, "crop_top");
-			p->crop_right = (int)obs_data_get_int(obj, "crop_right");
-			p->crop_bottom= (int)obs_data_get_int(obj, "crop_bottom");
-			p->bounds_x   = (float)obs_data_get_double(obj, "bounds_x");
-			p->bounds_y   = (float)obs_data_get_double(obj, "bounds_y");
-			p->bounds_type = (int)obs_data_get_int(obj, "bounds_type");
-			p->bounds_align= (uint32_t)obs_data_get_int(obj, "bounds_align");
-			/* Older saves lacked alignment; default to OBS_ALIGN_TOP|LEFT (5) */
-			p->alignment = obs_data_has_user_value(obj, "alignment")
-				? (uint32_t)obs_data_get_int(obj, "alignment")
-				: (OBS_ALIGN_TOP | OBS_ALIGN_LEFT);
-			p->duration_ms = (int)obs_data_get_int(obj, "preset_duration_ms");
-			p->transition_type = (int)obs_data_get_int(obj, "transition_type");
-			d->num_presets++;
-			obs_data_release(obj);
+	/* Load presets — preferring per-scene buckets, falling back to the
+	 * legacy flat "presets" array which gets migrated into a template
+	 * that seeds new buckets on first scene activation. */
+	obs_data_array_t *barr = obs_data_get_array(settings, "scene_buckets");
+	if (barr) {
+		size_t bcount = obs_data_array_count(barr);
+		if (bcount > MAX_SCENE_BUCKETS) bcount = MAX_SCENE_BUCKETS;
+		for (size_t bi = 0; bi < bcount; bi++) {
+			obs_data_t *bobj = obs_data_array_item(barr, bi);
+			struct shot_preset_bucket *bk = &d->buckets[d->num_buckets++];
+			memset(bk, 0, sizeof(*bk));
+			const char *sn = obs_data_get_string(bobj, "scene_name");
+			snprintf(bk->scene_name, sizeof(bk->scene_name), "%s",
+			         sn ? sn : "");
+			bk->current_preset = obs_data_has_user_value(bobj,
+				"current_preset") ? (int)obs_data_get_int(bobj,
+				"current_preset") : -1;
+			bk->default_preset = obs_data_has_user_value(bobj,
+				"default_preset") ? (int)obs_data_get_int(bobj,
+				"default_preset") : -1;
+			obs_data_array_t *parr = obs_data_get_array(bobj, "presets");
+			if (parr) {
+				size_t pcount = obs_data_array_count(parr);
+				if (pcount > MAX_PRESETS) pcount = MAX_PRESETS;
+				for (size_t pi = 0; pi < pcount; pi++) {
+					obs_data_t *pobj = obs_data_array_item(parr, pi);
+					load_one_preset(pobj, &bk->presets[bk->num_presets++]);
+					obs_data_release(pobj);
+				}
+				obs_data_array_release(parr);
+			}
+			obs_data_release(bobj);
 		}
-		obs_data_array_release(arr);
+		obs_data_array_release(barr);
+	} else {
+		/* Legacy migration path: read the flat "presets" array into the
+		 * legacy_template. The first time each scene's bucket is auto-
+		 * created, seed_bucket_from_legacy copies it in. We also pre-
+		 * seed buckets for every currently-enabled scene so the user's
+		 * existing data lands somewhere reachable even without revisits. */
+		obs_data_array_t *arr = obs_data_get_array(settings, "presets");
+		if (arr) {
+			size_t count = obs_data_array_count(arr);
+			if (count > MAX_PRESETS) count = MAX_PRESETS;
+			for (size_t i = 0; i < count; i++) {
+				obs_data_t *obj = obs_data_array_item(arr, i);
+				load_one_preset(obj, &d->legacy_presets[d->legacy_num_presets++]);
+				obs_data_release(obj);
+			}
+			obs_data_array_release(arr);
+			if (d->legacy_num_presets > 0) {
+				d->has_legacy_template = true;
+				blog(LOG_INFO,
+				     "[Shot Presets] migrating %d legacy presets to "
+				     "per-scene buckets",
+				     d->legacy_num_presets);
+				/* Pre-seed a bucket per enabled scene, plus a default
+				 * "" bucket so unbound filters still resolve before
+				 * the first scene-change event. */
+				for (int i = 0; i < d->num_enabled_scenes &&
+				     d->num_buckets < MAX_SCENE_BUCKETS; i++) {
+					get_or_create_bucket(d,
+						d->enabled_scenes[i]);
+				}
+				if (d->num_buckets == 0)
+					get_or_create_bucket(d, "");
+			}
+		}
 	}
 
-	/* Default to 3 presets if none saved */
-	if (d->num_presets == 0) {
-		const char *default_names[] = {"Wide", "Medium", "Close-up"};
-		for (int i = 0; i < 3; i++) {
-			snprintf(d->presets[i].name, PRESET_NAME_LEN, "%s",
-			         default_names[i]);
-			d->presets[i].scale_x = 1.0f;
-			d->presets[i].scale_y = 1.0f;
+	/* Default to 3 presets in the default bucket if nothing was loaded. */
+	if (d->num_buckets == 0) {
+		struct shot_preset_bucket *bk = get_or_create_bucket(d, "");
+		if (bk && bk->num_presets == 0) {
+			const char *default_names[] = {"Wide", "Medium", "Close-up"};
+			for (int i = 0; i < 3; i++) {
+				snprintf(bk->presets[i].name, PRESET_NAME_LEN, "%s",
+				         default_names[i]);
+				bk->presets[i].scale_x = 1.0f;
+				bk->presets[i].scale_y = 1.0f;
+			}
+			bk->num_presets = 3;
 		}
-		d->num_presets = 3;
 	}
 
-	/* Register hotkeys */
-	for (int i = 0; i < d->num_presets; i++) {
+	/* Register MAX_PRESETS hotkeys with generic names. The callback
+	 * resolves to the active bucket so the same key works across scenes
+	 * for the same slot. Description is generic since preset names now
+	 * vary per scene. */
+	for (int i = 0; i < MAX_PRESETS; i++) {
 		struct dstr hk_name = {0};
 		struct dstr hk_desc = {0};
 		dstr_printf(&hk_name, "shot_preset_%d", i);
-		dstr_printf(&hk_desc, "Shot Preset: %s", d->presets[i].name);
+		dstr_printf(&hk_desc, "Shot Preset %d (per-scene)", i + 1);
 		d->hotkeys[i] = obs_hotkey_register_source(
 			source, hk_name.array, hk_desc.array, hotkey_cb, d);
 		dstr_free(&hk_name);
 		dstr_free(&hk_desc);
 	}
 
-	blog(LOG_INFO, "[Shot Presets] filter_create returning d=%p", (void *)d);
+	blog(LOG_INFO, "[Shot Presets] filter_create returning d=%p (buckets=%d)",
+	     (void *)d, d->num_buckets);
 	return d;
 }
 
@@ -1322,16 +1598,17 @@ static bool on_get_transform(obs_properties_t *props, obs_property_t *prop,
 	const char *pname = obs_property_name(prop);
 	int idx = -1;
 	sscanf(pname, "get_transform_%d", &idx);
-	if (idx < 0 || idx >= d->num_presets)
+	struct shot_preset_bucket *bk = active_bucket(d);
+	if (!bk || idx < 0 || idx >= bk->num_presets)
 		return false;
 
-	if (capture_transform(d, &d->presets[idx])) {
-		d->presets[idx].active = true;
+	if (capture_transform(d, &bk->presets[idx])) {
+		bk->presets[idx].active = true;
 		obs_data_t *settings = obs_source_get_settings(d->source);
 		save_presets(d, settings);
 		obs_data_release(settings);
 		blog(LOG_INFO, "[Shot Presets] Saved transform for '%s'",
-		     d->presets[idx].name);
+		     bk->presets[idx].name);
 	}
 	return true;
 }
@@ -1354,24 +1631,16 @@ static bool on_add_preset(obs_properties_t *props, obs_property_t *prop,
 	UNUSED_PARAMETER(props);
 	UNUSED_PARAMETER(prop);
 	struct shot_presets_data *d = data;
-	if (d->num_presets >= MAX_PRESETS)
+	struct shot_preset_bucket *bk = active_bucket(d);
+	if (!bk || bk->num_presets >= MAX_PRESETS)
 		return true;
 
-	struct shot_preset *p = &d->presets[d->num_presets];
+	struct shot_preset *p = &bk->presets[bk->num_presets];
 	memset(p, 0, sizeof(*p));
-	snprintf(p->name, PRESET_NAME_LEN, "Shot %d", d->num_presets + 1);
+	snprintf(p->name, PRESET_NAME_LEN, "Shot %d", bk->num_presets + 1);
 	p->scale_x = 1.0f;
 	p->scale_y = 1.0f;
-	d->num_presets++;
-
-	struct dstr hk_name = {0};
-	struct dstr hk_desc = {0};
-	dstr_printf(&hk_name, "shot_preset_%d", d->num_presets - 1);
-	dstr_printf(&hk_desc, "Shot Preset: %s", p->name);
-	d->hotkeys[d->num_presets - 1] = obs_hotkey_register_source(
-		d->source, hk_name.array, hk_desc.array, hotkey_cb, d);
-	dstr_free(&hk_name);
-	dstr_free(&hk_desc);
+	bk->num_presets++;
 
 	obs_data_t *settings = obs_source_get_settings(d->source);
 	save_presets(d, settings);
@@ -1385,9 +1654,14 @@ static bool on_remove_preset(obs_properties_t *props, obs_property_t *prop,
 	UNUSED_PARAMETER(props);
 	UNUSED_PARAMETER(prop);
 	struct shot_presets_data *d = data;
-	if (d->num_presets <= 0)
+	struct shot_preset_bucket *bk = active_bucket(d);
+	if (!bk || bk->num_presets <= 0)
 		return true;
-	d->num_presets--;
+	bk->num_presets--;
+	if (bk->current_preset >= bk->num_presets)
+		bk->current_preset = -1;
+	if (bk->default_preset >= bk->num_presets)
+		bk->default_preset = -1;
 	obs_data_t *settings = obs_source_get_settings(d->source);
 	save_presets(d, settings);
 	obs_data_release(settings);
@@ -1464,13 +1738,21 @@ static void filter_update(void *data, obs_data_t *settings)
 	}
 	obs_frontend_source_list_free(&scenes);
 
-	for (int i = 0; i < d->num_presets; i++) {
-		char prop_name[64];
-		snprintf(prop_name, sizeof(prop_name), "preset_name_%d", i);
-		const char *new_name = obs_data_get_string(settings, prop_name);
-		if (new_name && *new_name)
-			snprintf(d->presets[i].name, PRESET_NAME_LEN, "%s",
-			         new_name);
+	/* Apply any preset_name_<i> overrides from the properties dialog to
+	 * the active bucket only. The properties UI doesn't enumerate buckets;
+	 * it operates on whichever scene is currently active. */
+	struct shot_preset_bucket *bk = peek_active_bucket(d);
+	if (bk) {
+		for (int i = 0; i < bk->num_presets; i++) {
+			char prop_name[64];
+			snprintf(prop_name, sizeof(prop_name),
+			         "preset_name_%d", i);
+			const char *new_name = obs_data_get_string(settings,
+				prop_name);
+			if (new_name && *new_name)
+				snprintf(bk->presets[i].name, PRESET_NAME_LEN,
+				         "%s", new_name);
+		}
 	}
 }
 
@@ -1503,12 +1785,15 @@ static bool sceneitem_differs_from_preset(const struct shot_preset *live,
 static void sync_sceneitem_to_parked_preset(struct shot_presets_data *d,
                                               float seconds)
 {
-	if (!d->user_activated || d->animating)
+	if (d->animating)
 		return;
-	if (d->current_preset < 0 || d->current_preset >= d->num_presets)
+	struct shot_preset_bucket *bk = peek_active_bucket(d);
+	if (!bk || !bk->user_activated)
+		return;
+	if (bk->current_preset < 0 || bk->current_preset >= bk->num_presets)
 		return;
 
-	struct shot_preset *p = &d->presets[d->current_preset];
+	struct shot_preset *p = &bk->presets[bk->current_preset];
 	if (!p->active)
 		return;
 
@@ -1582,15 +1867,16 @@ static void filter_tick(void *data, float seconds)
 	}
 
 	if (finished) {
+		struct shot_preset_bucket *fbk = peek_active_bucket(d);
 		if (d->fade_enabled) {
 			/* Restore the real target transform so the parked
 			 * sceneitem reflects the user's preset, not the
 			 * identity-fill-canvas override. */
-			if (d->current_preset >= 0 &&
-			    d->current_preset < d->num_presets &&
-			    d->presets[d->current_preset].active) {
+			if (fbk && fbk->current_preset >= 0 &&
+			    fbk->current_preset < fbk->num_presets &&
+			    fbk->presets[fbk->current_preset].active) {
 				struct shot_preset final =
-					d->presets[d->current_preset];
+					fbk->presets[fbk->current_preset];
 				apply_transform(d, &final, &final, 1.0f);
 			}
 			d->fade_enabled = false;
@@ -1604,11 +1890,11 @@ static void filter_tick(void *data, float seconds)
 			 * bounds_types. Snap to the original preset now so the
 			 * parked sceneitem carries the user's real
 			 * bounds_type/bounds/alignment. */
-			if (d->current_preset >= 0 &&
-			    d->current_preset < d->num_presets &&
-			    d->presets[d->current_preset].active) {
+			if (fbk && fbk->current_preset >= 0 &&
+			    fbk->current_preset < fbk->num_presets &&
+			    fbk->presets[fbk->current_preset].active) {
 				struct shot_preset final =
-					d->presets[d->current_preset];
+					fbk->presets[fbk->current_preset];
 				apply_transform(d, &final, &final, 1.0f);
 			}
 			blog(LOG_INFO,
@@ -1766,9 +2052,12 @@ static void filter_save(void *data, obs_data_t *settings)
 	save_presets(d, settings);
 	d->sync_dirty = false;
 	d->sync_debounce = 0.0f;
+	int total = 0;
+	for (int i = 0; i < d->num_buckets; i++)
+		total += d->buckets[i].num_presets;
 	blog(LOG_INFO,
-	     "[Shot Presets] filter_save flushed %d presets for instance=%p",
-	     d->num_presets, (void *)d);
+	     "[Shot Presets] filter_save flushed %d buckets / %d presets for instance=%p",
+	     d->num_buckets, total, (void *)d);
 }
 
 /* ── Registration ────────────────────────────────────────── */
@@ -1798,11 +2087,16 @@ static void update_active_for_current_scene(void)
 	obs_source_t *scene_src = obs_frontend_get_current_scene();
 	if (!scene_src) {
 		g_active_instance = NULL;
+		g_active_scene_name[0] = '\0';
 		blog(LOG_INFO,
 		     "[Shot Presets] active=NULL (no current scene)");
 		return;
 	}
 	const char *scene_name = obs_source_get_name(scene_src);
+	/* Update the global current-scene name BEFORE resolving the active
+	 * instance — active_bucket() consults it. */
+	snprintf(g_active_scene_name, sizeof(g_active_scene_name), "%s",
+	         scene_name ? scene_name : "");
 	obs_scene_t *scene = obs_scene_from_source(scene_src);
 	struct shot_presets_data *match = NULL;
 	const char *matched_source = NULL;
@@ -1836,11 +2130,20 @@ static void update_active_for_current_scene(void)
 		}
 	}
 	g_active_instance = match;
+	int bucket_count = 0;
+	int active_bucket_presets = 0;
+	if (match) {
+		bucket_count = match->num_buckets;
+		struct shot_preset_bucket *bk = peek_active_bucket(match);
+		if (bk) active_bucket_presets = bk->num_presets;
+	}
 	blog(LOG_INFO,
-	     "[Shot Presets] scene='%s' instances=%d active=%p (source='%s')",
+	     "[Shot Presets] scene='%s' instances=%d active=%p (source='%s') "
+	     "buckets=%d active_bucket_presets=%d",
 	     scene_name ? scene_name : "(null)", g_instance_count,
 	     (void *)g_active_instance,
-	     matched_source ? matched_source : "(none)");
+	     matched_source ? matched_source : "(none)",
+	     bucket_count, active_bucket_presets);
 	obs_source_release(scene_src);
 
 	/* Baseline snap: on scene activation, put the sceneitem into a
@@ -1851,16 +2154,31 @@ static void update_active_for_current_scene(void)
 	 * framing. Silent — doesn't flip user_activated, so live-edit
 	 * sync stays gated until the user explicitly picks a preset. */
 	if (match) {
-		int target = match->current_preset;
-		if (target < 0 || target >= match->num_presets ||
-		    !match->presets[target].active)
-			target = 0;
-		if (target < match->num_presets &&
-		    match->presets[target].active) {
-			snap_to_preset_silent(match, target);
-			blog(LOG_INFO,
-			     "[Shot Presets] baseline snap -> preset %d '%s'",
-			     target, match->presets[target].name);
+		struct shot_preset_bucket *bk = peek_active_bucket(match);
+		if (bk) {
+			/* Snap target priority: scene's explicit default →
+			 * last-clicked (current_preset) → preset 0. Each
+			 * fallback is gated on the preset being active. */
+			int target = -1;
+			if (bk->default_preset >= 0 &&
+			    bk->default_preset < bk->num_presets &&
+			    bk->presets[bk->default_preset].active)
+				target = bk->default_preset;
+			if (target < 0 && bk->current_preset >= 0 &&
+			    bk->current_preset < bk->num_presets &&
+			    bk->presets[bk->current_preset].active)
+				target = bk->current_preset;
+			if (target < 0 && bk->num_presets > 0 &&
+			    bk->presets[0].active)
+				target = 0;
+			if (target >= 0) {
+				snap_to_preset_silent(match, target);
+				blog(LOG_INFO,
+				     "[Shot Presets] baseline snap -> preset %d '%s' "
+				     "(default=%d current=%d)",
+				     target, bk->presets[target].name,
+				     bk->default_preset, bk->current_preset);
+			}
 		}
 	}
 }
