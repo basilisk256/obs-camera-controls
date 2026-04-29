@@ -2,12 +2,18 @@
 #include <obs-frontend-api.h>
 #include <graphics/matrix4.h>
 #include <util/dstr.h>
+#include <util/threading.h>
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
 #include "easing.h"
 #include "shot-presets-shared.h"
 #include "version.h"
+
+#ifdef _WIN32
+#include <windows.h>
+#include <winhttp.h>
+#endif
 
 /* ================================================================
  *  Shot Presets — OBS Filter Plugin
@@ -44,6 +50,9 @@ struct shot_preset {
 	uint32_t bounds_align;
 	int duration_ms;       /* 0 = use global default */
 	int transition_type;   /* 0 = move (animated), 1 = cut (instant) */
+	int atem_input;        /* ATEM program input to switch to when this
+	                        * preset fires (1-8). 0 = no ATEM action.
+	                        * Wired to FNN runtime at 127.0.0.1:4173. */
 };
 
 /* Per-scene bucket of presets. Each scene the filter is active in gets
@@ -297,6 +306,74 @@ static struct shot_preset_bucket *peek_active_bucket(
 	return find_bucket(d, g_active_scene_name);
 }
 
+/* ── ATEM trigger via FNN runtime ─────────────────────────────
+ * Fire-and-forget HTTP POST to http://127.0.0.1:4173/api/runtime/atem/
+ * program/<N>. The actual ATEM switch is done by the FNN runtime, which
+ * already owns the BMD ATEM connection. We just kick off a request from
+ * a detached thread so the framing animation isn't blocked on network
+ * I/O. If the FNN runtime isn't running, the connect fails silently. */
+
+#ifdef _WIN32
+static DWORD WINAPI atem_post_thread(LPVOID lpParam)
+{
+	int input = (int)(intptr_t)lpParam;
+	if (input < 1)
+		return 0;
+	HINTERNET hSession = WinHttpOpen(L"obs-shot-presets/1.0",
+		WINHTTP_ACCESS_TYPE_NO_PROXY,
+		WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+	if (!hSession)
+		return 0;
+	/* Tight timeouts — we don't want a stuck request piling up threads.
+	 * resolve, connect, send, receive — all in milliseconds. */
+	WinHttpSetTimeouts(hSession, 1500, 1500, 1500, 1500);
+	HINTERNET hConnect = WinHttpConnect(hSession, L"127.0.0.1", 4173, 0);
+	if (!hConnect) {
+		WinHttpCloseHandle(hSession);
+		return 0;
+	}
+	wchar_t path[64];
+	_snwprintf_s(path, 64, _TRUNCATE,
+	             L"/api/runtime/atem/program/%d", input);
+	HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"POST", path,
+		NULL, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, 0);
+	if (!hRequest) {
+		WinHttpCloseHandle(hConnect);
+		WinHttpCloseHandle(hSession);
+		return 0;
+	}
+	BOOL sent = WinHttpSendRequest(hRequest,
+		WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+		WINHTTP_NO_REQUEST_DATA, 0, 0, 0);
+	if (sent)
+		WinHttpReceiveResponse(hRequest, NULL);
+	WinHttpCloseHandle(hRequest);
+	WinHttpCloseHandle(hConnect);
+	WinHttpCloseHandle(hSession);
+	return 0;
+}
+#endif
+
+static void fire_atem_program(int input)
+{
+	if (input < 1)
+		return;
+#ifdef _WIN32
+	HANDLE h = CreateThread(NULL, 0, atem_post_thread,
+	                        (LPVOID)(intptr_t)input, 0, NULL);
+	if (h)
+		CloseHandle(h);
+	blog(LOG_INFO,
+	     "[Shot Presets] ATEM trigger: program input %d (fire-and-forget POST)",
+	     input);
+#else
+	blog(LOG_WARNING,
+	     "[Shot Presets] ATEM trigger requested for input %d but this "
+	     "build is non-Windows (WinHTTP not available)",
+	     input);
+#endif
+}
+
 /* ── Shared API for the dock ─────────────────────────────── */
 
 void shot_presets_go_to(int preset_index)
@@ -508,6 +585,32 @@ void shot_presets_set_transition(int index, int type)
 	if (!b || index < 0 || index >= b->num_presets)
 		return;
 	b->presets[index].transition_type = type;
+	obs_data_t *settings = obs_source_get_settings(d->source);
+	save_presets(d, settings);
+	obs_data_release(settings);
+}
+
+int shot_presets_get_atem_input(int index)
+{
+	if (!g_active_instance)
+		return 0;
+	struct shot_preset_bucket *b = peek_active_bucket(g_active_instance);
+	if (!b || index < 0 || index >= b->num_presets)
+		return 0;
+	return b->presets[index].atem_input;
+}
+
+void shot_presets_set_atem_input(int index, int input)
+{
+	if (!g_active_instance)
+		return;
+	struct shot_presets_data *d = g_active_instance;
+	struct shot_preset_bucket *b = active_bucket(d);
+	if (!b || index < 0 || index >= b->num_presets)
+		return;
+	if (input < 0) input = 0;
+	if (input > 8) input = 8;
+	b->presets[index].atem_input = input;
 	obs_data_t *settings = obs_source_get_settings(d->source);
 	save_presets(d, settings);
 	obs_data_release(settings);
@@ -1234,6 +1337,9 @@ static void go_to_preset_override(struct shot_presets_data *d, int index,
 	}
 
 	d->animating = true;
+	/* Fire ATEM switch alongside framing animation. Fire-and-forget so
+	 * a slow/down FNN runtime never stalls the frame-perfect transition. */
+	fire_atem_program(bk->presets[index].atem_input);
 	blog(LOG_INFO,
 	     "[Shot Presets] move START -> '%s' (%d ms)  "
 	     "from pos=(%.1f,%.1f) scale=(%.2f,%.2f) crop=(%d,%d,%d,%d) "
@@ -1288,6 +1394,8 @@ void cut_to_preset(struct shot_presets_data *d, int index)
 	bk->current_preset = index;
 	bk->user_activated = true;
 	d->sync_dirty = false;
+	/* Fire ATEM switch alongside the cut. */
+	fire_atem_program(bk->presets[index].atem_input);
 	struct shot_preset target = bk->presets[index];
 
 	obs_source_t *parent = obs_filter_get_parent(d->source);
@@ -1357,6 +1465,7 @@ static void save_one_preset(obs_data_t *obj, const struct shot_preset *p)
 	obs_data_set_int(obj, "alignment", (int)p->alignment);
 	obs_data_set_int(obj, "preset_duration_ms", p->duration_ms);
 	obs_data_set_int(obj, "transition_type", p->transition_type);
+	obs_data_set_int(obj, "atem_input", p->atem_input);
 }
 
 void save_presets(struct shot_presets_data *d, obs_data_t *settings)
@@ -1461,6 +1570,7 @@ static void load_one_preset(obs_data_t *obj, struct shot_preset *p)
 		: (OBS_ALIGN_TOP | OBS_ALIGN_LEFT);
 	p->duration_ms = (int)obs_data_get_int(obj, "preset_duration_ms");
 	p->transition_type = (int)obs_data_get_int(obj, "transition_type");
+	p->atem_input = (int)obs_data_get_int(obj, "atem_input"); /* 0 if missing */
 }
 
 /* ── Filter callbacks ────────────────────────────────────── */

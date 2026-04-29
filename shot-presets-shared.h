@@ -58,6 +58,12 @@ typedef enum {
 int shot_presets_get_transition(int index);
 void shot_presets_set_transition(int index, int type);
 
+/* Per-preset ATEM program input. 0 = no ATEM action, 1-8 = switch the
+ * ATEM to that input when this preset fires. The actual switch is done
+ * by the FNN runtime over HTTP at 127.0.0.1:4173. */
+int shot_presets_get_atem_input(int index);
+void shot_presets_set_atem_input(int index, int input);
+
 /* Add / remove presets in the active filter */
 void shot_presets_add_preset(const char *name);
 void shot_presets_remove_preset(int index);

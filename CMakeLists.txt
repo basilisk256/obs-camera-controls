@@ -27,6 +27,11 @@ else()
   target_link_libraries(${PROJECT_NAME} PRIVATE OBS::frontend-api Qt6::Widgets)
 endif()
 
+# WinHTTP for fire-and-forget ATEM triggers via the FNN runtime.
+if(WIN32)
+  target_link_libraries(${PROJECT_NAME} PRIVATE winhttp)
+endif()
+
 set_target_properties(${PROJECT_NAME} PROPERTIES
   MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
   AUTOMOC ON)

@@ -265,6 +265,27 @@ void ShotPresetsDock::refreshUI()
 			durRow2->addStretch();
 			epLayout->addLayout(durRow2);
 
+			/* ATEM program input. Fires HTTP POST to FNN runtime
+			 * on any preset trigger so the ATEM Mini cuts to the
+			 * matching camera in lockstep with the framing change.
+			 * 0 = no ATEM action for this preset. */
+			QHBoxLayout *atemRow = new QHBoxLayout();
+			atemRow->addWidget(new QLabel("ATEM input:"));
+			QSpinBox *atemSpin = new QSpinBox();
+			atemSpin->setRange(0, 8);
+			atemSpin->setSpecialValueText("(none)");
+			atemSpin->setToolTip(
+				"ATEM program input to switch to when this shot fires. "
+				"0 = no ATEM action. Requires FNN runtime running on "
+				"127.0.0.1:4173.");
+			connect(atemSpin, QOverload<int>::of(&QSpinBox::valueChanged),
+				this, [this, i](int v) {
+					onAtemInputChanged(i, v);
+				});
+			atemRow->addWidget(atemSpin);
+			atemRow->addStretch();
+			epLayout->addLayout(atemRow);
+
 			/* Edit panel intentionally minimal \u2014 framing is set by
 			 * dragging in OBS preview, then committed via the row's
 			 * Save button. The transform/crop/bounds spinboxes used
@@ -283,7 +304,7 @@ void ShotPresetsDock::refreshUI()
 
 			PresetRow pr = {goBtn, fadeBtn, cutBtn, capBtn, editBtn,
 					defBtn, editPanel, pDur, transCb, nameEd,
-					removeBtn};
+					atemSpin, removeBtn};
 			presetRows.append(pr);
 		}
 	}
@@ -340,6 +361,13 @@ void ShotPresetsDock::refreshUI()
 				ne->setText(actual);
 			}
 		}
+
+		int atemInput = shot_presets_get_atem_input(i);
+		QSpinBox *as = presetRows[i].atemInputSpin;
+		if (as && !as->hasFocus() && as->value() != atemInput) {
+			QSignalBlocker b(as);
+			as->setValue(atemInput);
+		}
 	}
 }
 
@@ -379,6 +407,11 @@ void ShotPresetsDock::onPresetDurationChanged(int index, int value)
 void ShotPresetsDock::onTransitionChanged(int index, int type)
 {
 	shot_presets_set_transition(index, type);
+}
+
+void ShotPresetsDock::onAtemInputChanged(int index, int value)
+{
+	shot_presets_set_atem_input(index, value);
 }
 
 void ShotPresetsDock::onNameChanged(int index, const QString &name)

@@ -28,6 +28,7 @@ private slots:
 	void onPresetDurationChanged(int index, int value);
 	void onTransitionChanged(int index, int type);
 	void onNameChanged(int index, const QString &name);
+	void onAtemInputChanged(int index, int value);
 	void onAddPreset();
 	void onRemovePreset(int index);
 	void onDefaultToggled(int index);
@@ -57,6 +58,7 @@ private:
 		QSpinBox *presetDurSpin;
 		QComboBox *transitionCb;
 		QLineEdit *nameEdit;
+		QSpinBox *atemInputSpin;
 		QPushButton *removeBtn;
 	};
 	QVector<PresetRow> presetRows;
