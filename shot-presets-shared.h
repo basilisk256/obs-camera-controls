@@ -41,8 +41,11 @@ void shot_presets_set_preset_duration(int index, int ms);
 void shot_presets_get_crop(int index, int *l, int *t, int *r, int *b);
 void shot_presets_set_crop(int index, int l, int t, int r, int b);
 
-/* Save current transform into preset */
-void shot_presets_capture(int preset_index);
+/* Save current transform into preset. Returns 1 on success, 0 if the
+ * capture failed (e.g. parent source not found in the active scene, or
+ * filter restricted to other scenes via the properties dialog). The dock
+ * uses the return to flash green vs red. */
+int shot_presets_capture(int preset_index);
 
 /* Per-preset transition type */
 typedef enum {

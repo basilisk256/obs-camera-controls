@@ -394,29 +394,57 @@ void shot_presets_set_duration(int ms)
 	g_active_instance->duration_ms = ms;
 }
 
-void shot_presets_capture(int preset_index)
+int shot_presets_capture(int preset_index)
 {
-	if (!g_active_instance)
-		return;
+	if (!g_active_instance) {
+		blog(LOG_WARNING,
+		     "[Shot Presets] capture(%d) FAIL: no active filter "
+		     "instance for current scene",
+		     preset_index);
+		return 0;
+	}
 	struct shot_presets_data *d = g_active_instance;
 	struct shot_preset_bucket *bk = active_bucket(d);
-	if (!bk || preset_index < 0 || preset_index >= bk->num_presets)
-		return;
-	if (capture_transform(d, &bk->presets[preset_index])) {
-		bk->presets[preset_index].active = true;
-		/* Route subsequent live-edit-while-parked writes into THIS
-		 * slot, not whichever preset was parked before the capture.
-		 * Otherwise a drag right after capturing Medium would sync
-		 * into Wide because current_preset never moved. */
-		bk->current_preset = preset_index;
-		bk->user_activated = true;
-		d->animating = false;
-		d->sync_dirty = false;
-		d->sync_debounce = 0.0f;
-		obs_data_t *settings = obs_source_get_settings(d->source);
-		save_presets(d, settings);
-		obs_data_release(settings);
+	if (!bk) {
+		blog(LOG_WARNING,
+		     "[Shot Presets] capture(%d) FAIL: no bucket for scene '%s'",
+		     preset_index, g_active_scene_name);
+		return 0;
 	}
+	if (preset_index < 0 || preset_index >= bk->num_presets) {
+		blog(LOG_WARNING,
+		     "[Shot Presets] capture(%d) FAIL: bad index "
+		     "(scene='%s' num_presets=%d)",
+		     preset_index, bk->scene_name, bk->num_presets);
+		return 0;
+	}
+	if (!capture_transform(d, &bk->presets[preset_index])) {
+		blog(LOG_WARNING,
+		     "[Shot Presets] capture(%d '%s') FAIL: capture_transform "
+		     "returned false for scene '%s' — source missing from "
+		     "scene, or filter restricted via properties (enabled "
+		     "scenes count = %d)",
+		     preset_index, bk->presets[preset_index].name,
+		     bk->scene_name, d->num_enabled_scenes);
+		return 0;
+	}
+	bk->presets[preset_index].active = true;
+	/* Route subsequent live-edit-while-parked writes into THIS
+	 * slot, not whichever preset was parked before the capture.
+	 * Otherwise a drag right after capturing Medium would sync
+	 * into Wide because current_preset never moved. */
+	bk->current_preset = preset_index;
+	bk->user_activated = true;
+	d->animating = false;
+	d->sync_dirty = false;
+	d->sync_debounce = 0.0f;
+	obs_data_t *settings = obs_source_get_settings(d->source);
+	save_presets(d, settings);
+	obs_data_release(settings);
+	blog(LOG_INFO,
+	     "[Shot Presets] capture(%d '%s') OK in scene '%s'",
+	     preset_index, bk->presets[preset_index].name, bk->scene_name);
+	return 1;
 }
 
 int shot_presets_get_preset_duration(int index)
@@ -1361,6 +1389,29 @@ void save_presets(struct shot_presets_data *d, obs_data_t *settings)
 	 * divergence if someone downgrades. */
 	obs_data_erase(settings, "presets");
 
+	/* Persistence visibility — every save logs a one-liner with bucket
+	 * count and per-bucket preset counts so persistence problems are
+	 * visible in the OBS log without digging through scene_collection.json. */
+	{
+		struct dstr summary = {0};
+		dstr_init(&summary);
+		for (int i = 0; i < d->num_buckets; i++) {
+			if (i > 0) dstr_cat(&summary, ", ");
+			char tmp[320];
+			snprintf(tmp, sizeof(tmp), "'%s'=%d",
+			         d->buckets[i].scene_name[0]
+				         ? d->buckets[i].scene_name
+				         : "(default)",
+			         d->buckets[i].num_presets);
+			dstr_cat(&summary, tmp);
+		}
+		blog(LOG_INFO,
+		     "[Shot Presets] save_presets wrote %d buckets: %s",
+		     d->num_buckets,
+		     summary.array ? summary.array : "(none)");
+		dstr_free(&summary);
+	}
+
 	/* Persist enabled scenes both as an explicit array (primary record)
 	 * and as scene_enabled_<name> bools (so the properties-dialog
 	 * checkboxes stay in sync). */
@@ -1532,6 +1583,27 @@ static void *filter_create(obs_data_t *settings, obs_source_t *source)
 				     "[Shot Presets] migrating %d legacy presets to "
 				     "per-scene buckets",
 				     d->legacy_num_presets);
+				/* Stale enabled_scenes from the previous plugin's
+				 * auto-bind would block capture in any other scene.
+				 * With per-scene buckets we want the filter active
+				 * everywhere by default — clear it. The user can
+				 * re-restrict via the properties dialog if they
+				 * actually want only certain scenes. */
+				if (d->num_enabled_scenes > 0) {
+					blog(LOG_INFO,
+					     "[Shot Presets] clearing %d stale "
+					     "enabled_scenes from legacy auto-bind "
+					     "so per-scene buckets work everywhere",
+					     d->num_enabled_scenes);
+					for (int i = 0; i < d->num_enabled_scenes; i++) {
+						char key[320];
+						snprintf(key, sizeof(key),
+						         "scene_enabled_%s",
+						         d->enabled_scenes[i]);
+						obs_data_set_bool(settings, key, false);
+					}
+					d->num_enabled_scenes = 0;
+				}
 				/* Pre-seed a bucket per enabled scene, plus a default
 				 * "" bucket so unbound filters still resolve before
 				 * the first scene-change event. */
@@ -2185,27 +2257,39 @@ static void update_active_for_current_scene(void)
 		struct shot_preset_bucket *bk = peek_active_bucket(match);
 		if (bk) {
 			/* Snap target priority: scene's explicit default →
-			 * last-clicked (current_preset) → preset 0. Each
-			 * fallback is gated on the preset being active. */
+			 * last-clicked (current_preset). Snap is gated on
+			 * the bucket having user_activated OR a default set —
+			 * untouched buckets (e.g. seeded from legacy migration
+			 * but never engaged) leave the OBS-stored sceneitem
+			 * transform alone, so manually-arranged framings
+			 * aren't clobbered by stale preset data. */
 			int target = -1;
 			if (bk->default_preset >= 0 &&
 			    bk->default_preset < bk->num_presets &&
 			    bk->presets[bk->default_preset].active)
 				target = bk->default_preset;
-			if (target < 0 && bk->current_preset >= 0 &&
+			if (target < 0 && bk->user_activated &&
+			    bk->current_preset >= 0 &&
 			    bk->current_preset < bk->num_presets &&
 			    bk->presets[bk->current_preset].active)
 				target = bk->current_preset;
-			if (target < 0 && bk->num_presets > 0 &&
-			    bk->presets[0].active)
-				target = 0;
 			if (target >= 0) {
 				snap_to_preset_silent(match, target);
 				blog(LOG_INFO,
 				     "[Shot Presets] baseline snap -> preset %d '%s' "
-				     "(default=%d current=%d)",
+				     "(default=%d current=%d user_activated=%d)",
 				     target, bk->presets[target].name,
-				     bk->default_preset, bk->current_preset);
+				     bk->default_preset, bk->current_preset,
+				     bk->user_activated);
+			} else {
+				blog(LOG_INFO,
+				     "[Shot Presets] no baseline snap for scene "
+				     "'%s' (default=%d current=%d user_activated=%d "
+				     "presets=%d) — leaving sceneitem transform "
+				     "alone",
+				     bk->scene_name, bk->default_preset,
+				     bk->current_preset, bk->user_activated,
+				     bk->num_presets);
 			}
 		}
 	}

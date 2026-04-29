@@ -411,28 +411,41 @@ void ShotPresetsDock::onDefaultToggled(int index)
 
 void ShotPresetsDock::onCaptureClicked(int index)
 {
-	shot_presets_capture(index);
+	int ok = shot_presets_capture(index);
 	refreshUI();
 
-	/* Visual confirmation: flash the Save button green for ~700 ms so
-	 * the user knows the current preview framing was actually committed
-	 * to the scene's bucket. Reverts to the row's normal style afterwards. */
+	/* Visual confirmation: green flash on success (data committed to
+	 * the active bucket); red flash on failure (capture didn't happen
+	 * — usually means source missing from the active scene or filter
+	 * restricted via properties). Tooltip on failure points the user
+	 * at the OBS log for the reason. */
 	if (index < 0 || index >= presetRows.size())
 		return;
 	QPushButton *btn = presetRows[index].captureBtn;
 	if (!btn)
 		return;
-	const QString flashStyle =
-		"QPushButton { font-size: 11px; padding: 4px; "
-		"background: #2e8b3a; color: #fff; "
-		"border: 1px solid #4cc25f; }";
 	const QString restoreStyle =
 		"QPushButton { font-size: 11px; padding: 4px; }";
+	const QString flashStyle = ok
+		? QString("QPushButton { font-size: 11px; padding: 4px; "
+		          "background: #2e8b3a; color: #fff; "
+		          "border: 1px solid #4cc25f; }")
+		: QString("QPushButton { font-size: 11px; padding: 4px; "
+		          "background: #8b2e2e; color: #fff; "
+		          "border: 1px solid #c25a4c; }");
 	btn->setStyleSheet(flashStyle);
+	const QString restoreTip = "Save current transform to this preset";
+	if (!ok) {
+		btn->setToolTip(
+			"Capture failed — source not in active scene or filter "
+			"restricted via properties dialog. See OBS log for details.");
+	}
 	QPointer<QPushButton> guard(btn);
-	QTimer::singleShot(700, this, [guard, restoreStyle]() {
-		if (guard)
+	QTimer::singleShot(900, this, [guard, restoreStyle, restoreTip]() {
+		if (guard) {
 			guard->setStyleSheet(restoreStyle);
+			guard->setToolTip(restoreTip);
+		}
 	});
 }
 
