@@ -198,6 +198,8 @@ static char g_active_scene_name[SCENE_NAME_LEN] = "";
 
 /* forward declaration */
 void go_to_preset(struct shot_presets_data *d, int index);
+static void go_to_preset_override(struct shot_presets_data *d, int index,
+                                   int transition_override);
 void cut_to_preset(struct shot_presets_data *d, int index);
 bool capture_transform(struct shot_presets_data *d, struct shot_preset *p);
 void save_presets(struct shot_presets_data *d, obs_data_t *settings);
@@ -308,6 +310,20 @@ void shot_presets_cut(int preset_index)
 	} else
 		blog(LOG_WARNING,
 		     "[Shot Presets] cut: no active instance");
+}
+
+void shot_presets_fade(int preset_index)
+{
+	blog(LOG_INFO,
+	     "[Shot Presets] shot_presets_fade(%d) called, g_active_instance=%p",
+	     preset_index, (void *)g_active_instance);
+	if (g_active_instance) {
+		bind_home_scene_if_needed(g_active_instance);
+		go_to_preset_override(g_active_instance, preset_index,
+		                       SHOT_TRANSITION_FADE);
+	} else
+		blog(LOG_WARNING,
+		     "[Shot Presets] fade: no active instance");
 }
 
 int shot_presets_get_count(void)
@@ -1038,6 +1054,12 @@ static void normalize_preset_to_none(struct shot_preset *p,
 
 void go_to_preset(struct shot_presets_data *d, int index)
 {
+	go_to_preset_override(d, index, -1);
+}
+
+static void go_to_preset_override(struct shot_presets_data *d, int index,
+                                   int transition_override)
+{
 	struct shot_preset_bucket *bk = active_bucket(d);
 	if (!bk) {
 		blog(LOG_WARNING,
@@ -1096,7 +1118,10 @@ void go_to_preset(struct shot_presets_data *d, int index)
 	if (d->active_duration_ms < 50)
 		d->active_duration_ms = 400;
 
-	bool is_fade = (bk->presets[index].transition_type == SHOT_TRANSITION_FADE);
+	int effective_transition = (transition_override >= 0)
+		? transition_override
+		: bk->presets[index].transition_type;
+	bool is_fade = (effective_transition == SHOT_TRANSITION_FADE);
 	d->fade_enabled = false;
 	d->fade_t = 0.0f;
 

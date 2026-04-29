@@ -11,6 +11,12 @@ void shot_presets_go_to(int preset_index);
 /* Same as go_to, but applies the target transform instantly (no animation) */
 void shot_presets_cut(int preset_index);
 
+/* Same as go_to, but forces a cross-dissolve regardless of the preset's
+ * configured transition. Used by the dock's per-row Fade button so the
+ * user can override the default move/cut on the fly without editing the
+ * preset's transition setting. */
+void shot_presets_fade(int preset_index);
+
 /* Query how many presets the active filter has */
 int shot_presets_get_count(void);
 

@@ -21,6 +21,7 @@ public:
 private slots:
 	void onPresetClicked(int index);
 	void onCutClicked(int index);
+	void onFadeClicked(int index);
 	void onCaptureClicked(int index);
 	void onEditToggled(int index);
 	void onDurationChanged(int value);
@@ -47,6 +48,7 @@ private:
 
 	struct PresetRow {
 		QPushButton *goBtn;
+		QPushButton *fadeBtn;
 		QPushButton *cutBtn;
 		QPushButton *captureBtn;
 		QPushButton *editBtn;

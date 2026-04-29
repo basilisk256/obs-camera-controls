@@ -143,6 +143,20 @@ void ShotPresetsDock::refreshUI()
 			goBtn->setContextMenuPolicy(Qt::NoContextMenu);
 			row->addWidget(goBtn);
 
+			/* Fade button forces a cross-dissolve regardless of the
+			 * preset's configured transition. Same width as Cut. */
+			QPushButton *fadeBtn = new QPushButton("Fade");
+			fadeBtn->setToolTip("Fade (cross-dissolve) to this preset");
+			fadeBtn->setFixedWidth(50);
+			fadeBtn->setMinimumHeight(40);
+			fadeBtn->setStyleSheet(
+				"QPushButton { font-size: 12px; font-weight: bold; padding: 4px; background: #2a3a5a; }"
+				"QPushButton:hover { background: #3a4a7a; }"
+				"QPushButton:disabled { color: #666; background: #2a2a2a; }");
+			connect(fadeBtn, &QPushButton::clicked, this,
+				[this, i]() { onFadeClicked(i); });
+			row->addWidget(fadeBtn);
+
 			QPushButton *cutBtn = new QPushButton("Cut");
 			cutBtn->setToolTip("Cut to this preset instantly (no animation)");
 			cutBtn->setFixedWidth(50);
@@ -267,8 +281,8 @@ void ShotPresetsDock::refreshUI()
 			rowContainerLayout->addWidget(editPanel);
 			presetsLayout->addWidget(rowContainer);
 
-			PresetRow pr = {goBtn, cutBtn, capBtn, editBtn, defBtn,
-					editPanel, pDur, transCb, nameEd,
+			PresetRow pr = {goBtn, fadeBtn, cutBtn, capBtn, editBtn,
+					defBtn, editPanel, pDur, transCb, nameEd,
 					removeBtn};
 			presetRows.append(pr);
 		}
@@ -285,6 +299,8 @@ void ShotPresetsDock::refreshUI()
 		presetRows[i].goBtn->setText(label);
 		presetRows[i].goBtn->setEnabled(active);
 		presetRows[i].cutBtn->setEnabled(active);
+		if (presetRows[i].fadeBtn)
+			presetRows[i].fadeBtn->setEnabled(active);
 
 		/* Sync star button to backend default state */
 		QPushButton *db = presetRows[i].defaultBtn;
@@ -338,6 +354,11 @@ void ShotPresetsDock::onPresetClicked(int index)
 void ShotPresetsDock::onCutClicked(int index)
 {
 	shot_presets_cut(index);
+}
+
+void ShotPresetsDock::onFadeClicked(int index)
+{
+	shot_presets_fade(index);
 }
 
 void ShotPresetsDock::onEditToggled(int index)
