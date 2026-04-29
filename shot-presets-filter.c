@@ -203,7 +203,6 @@ static void go_to_preset_override(struct shot_presets_data *d, int index,
 void cut_to_preset(struct shot_presets_data *d, int index);
 bool capture_transform(struct shot_presets_data *d, struct shot_preset *p);
 void save_presets(struct shot_presets_data *d, obs_data_t *settings);
-static void bind_home_scene_if_needed(struct shot_presets_data *d);
 static bool is_scene_enabled(struct shot_presets_data *d, const char *name);
 static void apply_transform(struct shot_presets_data *d,
                             struct shot_preset *from,
@@ -262,6 +261,21 @@ static struct shot_preset_bucket *get_or_create_bucket(
 	return b;
 }
 
+/* Returns the scene the user is currently editing visually. In studio
+ * mode this is the PREVIEW scene (left pane), since that's what the
+ * user reframes; otherwise it's the program scene. Caller must release
+ * with obs_source_release. Returns NULL if neither is available. */
+static obs_source_t *get_editing_scene_source(void)
+{
+	if (obs_frontend_preview_program_mode_active()) {
+		obs_source_t *prev =
+			obs_frontend_get_current_preview_scene();
+		if (prev)
+			return prev;
+	}
+	return obs_frontend_get_current_scene();
+}
+
 /* Bucket for the current OBS scene. Auto-creates if writing to a scene
  * that hasn't been touched before. Returns NULL only if MAX_SCENE_BUCKETS
  * is exceeded — callers must guard. */
@@ -291,7 +305,6 @@ void shot_presets_go_to(int preset_index)
 	     "[Shot Presets] shot_presets_go_to(%d) called, g_active_instance=%p",
 	     preset_index, (void *)g_active_instance);
 	if (g_active_instance) {
-		bind_home_scene_if_needed(g_active_instance);
 		go_to_preset(g_active_instance, preset_index);
 	} else
 		blog(LOG_WARNING,
@@ -305,7 +318,6 @@ void shot_presets_cut(int preset_index)
 	     "[Shot Presets] shot_presets_cut(%d) called, g_active_instance=%p",
 	     preset_index, (void *)g_active_instance);
 	if (g_active_instance) {
-		bind_home_scene_if_needed(g_active_instance);
 		cut_to_preset(g_active_instance, preset_index);
 	} else
 		blog(LOG_WARNING,
@@ -318,7 +330,6 @@ void shot_presets_fade(int preset_index)
 	     "[Shot Presets] shot_presets_fade(%d) called, g_active_instance=%p",
 	     preset_index, (void *)g_active_instance);
 	if (g_active_instance) {
-		bind_home_scene_if_needed(g_active_instance);
 		go_to_preset_override(g_active_instance, preset_index,
 		                       SHOT_TRANSITION_FADE);
 	} else
@@ -388,7 +399,6 @@ void shot_presets_capture(int preset_index)
 	if (!g_active_instance)
 		return;
 	struct shot_presets_data *d = g_active_instance;
-	bind_home_scene_if_needed(d);
 	struct shot_preset_bucket *bk = active_bucket(d);
 	if (!bk || preset_index < 0 || preset_index >= bk->num_presets)
 		return;
@@ -789,35 +799,11 @@ static bool is_scene_enabled(struct shot_presets_data *d, const char *name)
 	return false;
 }
 
-/* If the enabled-scenes list is empty, seed it with the current scene.
- * Called from explicit user actions (go_to / capture / cut) so the first
- * scene in which the user actually drives shot presets becomes enabled.
- * Also flips the corresponding `scene_enabled_<name>` bool in settings so
- * the properties-dialog checkbox reflects the auto-binding next open. */
-static void bind_home_scene_if_needed(struct shot_presets_data *d)
-{
-	if (d->num_enabled_scenes > 0)
-		return;
-	obs_source_t *scene = obs_frontend_get_current_scene();
-	if (!scene)
-		scene = obs_frontend_get_current_preview_scene();
-	if (!scene)
-		return;
-	const char *name = obs_source_get_name(scene);
-	if (name && *name) {
-		snprintf(d->enabled_scenes[0], 256, "%s", name);
-		d->num_enabled_scenes = 1;
-		blog(LOG_INFO,
-		     "[Shot Presets] auto-enabled in scene '%s'", name);
-		obs_data_t *settings = obs_source_get_settings(d->source);
-		char key[320];
-		snprintf(key, sizeof(key), "scene_enabled_%s", name);
-		obs_data_set_bool(settings, key, true);
-		save_presets(d, settings);
-		obs_data_release(settings);
-	}
-	obs_source_release(scene);
-}
+/* (bind_home_scene_if_needed removed: per-scene buckets need the filter
+ * to activate in every scene containing its source, so we no longer
+ * auto-bind the first-touched scene into enabled_scenes. Users who want
+ * to restrict can still tick scenes in the filter properties dialog —
+ * an empty list means "active in any scene with this source.") */
 
 static obs_sceneitem_t *find_scene_item(struct shot_presets_data *d)
 {
@@ -827,9 +813,12 @@ static obs_sceneitem_t *find_scene_item(struct shot_presets_data *d)
 
 	const char *parent_name = obs_source_get_name(parent);
 
-	obs_source_t *scene_source = obs_frontend_get_current_scene();
-	if (!scene_source)
-		scene_source = obs_frontend_get_current_preview_scene();
+	/* Same studio-mode-aware resolution as the active-bucket lookup so
+	 * the sceneitem we operate on matches the scene whose bucket the
+	 * dock is showing. Without this, captures in studio mode silently
+	 * write to the program scene's sceneitem while the user thinks
+	 * they're framing the preview scene. */
+	obs_source_t *scene_source = get_editing_scene_source();
 	if (!scene_source)
 		return NULL;
 
@@ -2109,7 +2098,21 @@ extern void shot_presets_dock_init(void);
 
 static void update_active_for_current_scene(void)
 {
-	obs_source_t *scene_src = obs_frontend_get_current_scene();
+	/* Flush any pending sync writes from the previous scene's bucket
+	 * before switching active context — a drag-then-switch within the
+	 * 0.4s debounce window would otherwise lose the unsaved transform. */
+	if (g_active_instance && g_active_instance->sync_dirty) {
+		obs_data_t *settings =
+			obs_source_get_settings(g_active_instance->source);
+		save_presets(g_active_instance, settings);
+		obs_data_release(settings);
+		g_active_instance->sync_dirty = false;
+		g_active_instance->sync_debounce = 0.0f;
+		blog(LOG_INFO,
+		     "[Shot Presets] flushed pending sync on scene change");
+	}
+
+	obs_source_t *scene_src = get_editing_scene_source();
 	if (!scene_src) {
 		g_active_instance = NULL;
 		g_active_scene_name[0] = '\0';
@@ -2211,9 +2214,19 @@ static void update_active_for_current_scene(void)
 static void on_scene_changed(enum obs_frontend_event event, void *unused)
 {
 	UNUSED_PARAMETER(unused);
-	if (event == OBS_FRONTEND_EVENT_SCENE_CHANGED ||
-	    event == OBS_FRONTEND_EVENT_FINISHED_LOADING) {
+	/* Re-resolve active scene on any event that could change which
+	 * scene the user is editing — including studio-mode toggles and
+	 * preview-scene swaps which the original code missed. */
+	switch (event) {
+	case OBS_FRONTEND_EVENT_SCENE_CHANGED:
+	case OBS_FRONTEND_EVENT_PREVIEW_SCENE_CHANGED:
+	case OBS_FRONTEND_EVENT_STUDIO_MODE_ENABLED:
+	case OBS_FRONTEND_EVENT_STUDIO_MODE_DISABLED:
+	case OBS_FRONTEND_EVENT_FINISHED_LOADING:
 		update_active_for_current_scene();
+		break;
+	default:
+		break;
 	}
 }
 
