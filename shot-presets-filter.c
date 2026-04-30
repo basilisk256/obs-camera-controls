@@ -472,12 +472,17 @@ int shot_presets_capture(int preset_index)
 		return 0;
 	}
 	bk->presets[preset_index].active = true;
-	/* Route subsequent live-edit-while-parked writes into THIS
-	 * slot, not whichever preset was parked before the capture.
-	 * Otherwise a drag right after capturing Medium would sync
-	 * into Wide because current_preset never moved. */
 	bk->current_preset = preset_index;
-	bk->user_activated = true;
+	/* Deliberately do NOT set user_activated = true here. Save is an
+	 * explicit user action; arming live-edit-while-parked sync after
+	 * a capture means the very next drag (e.g. "now I'm setting up
+	 * the next preset") silently overwrites the preset we just saved.
+	 * That trashed the user's Medium and Left presets in a real
+	 * session — they captured Medium, then dragged to set up Left,
+	 * and the drag synced into Medium because current_preset was 1.
+	 * Live-edit-sync still arms when the user explicitly *clicks* a
+	 * title button (go_to / cut_to), which is the right semantics:
+	 * "I'm now refining this preset." */
 	d->animating = false;
 	d->sync_dirty = false;
 	d->sync_debounce = 0.0f;
