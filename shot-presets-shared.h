@@ -71,6 +71,20 @@ void shot_presets_remove_preset(int index);
 /* Is there an active Shot Presets filter on the current scene? */
 int shot_presets_has_active(void);
 
+/* Index of the currently-parked preset (last clicked) for the active
+ * scene's bucket. -1 if none. The dock uses this to highlight the row
+ * the user is "on" so they know what they're editing. */
+int shot_presets_get_current_preset(void);
+
+/* Global ATEM sync delay in ms. When a preset with atem_input fires,
+ * the ATEM SetProgramInput is queued immediately but the sceneitem
+ * transform is held back by this many ms — so the OBS framing change
+ * lands together with the new ATEM video frame (USB capture latency +
+ * any Render Delay filter the user has on the source). 0 = disabled,
+ * apply transform immediately. */
+int  shot_presets_get_atem_sync_delay(void);
+void shot_presets_set_atem_sync_delay(int ms);
+
 /* Per-scene default preset. The filter snaps to this preset when the scene
  * activates, instead of the last-clicked one. -1 = no default set (falls
  * back to current_preset, then preset 0). Setting clears any previous

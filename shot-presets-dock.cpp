@@ -43,7 +43,9 @@ void ShotPresetsDock::buildUI()
 	mainLayout->setContentsMargins(6, 6, 6, 6);
 	mainLayout->setSpacing(4);
 
-	/* Duration control */
+	/* Duration + ATEM-sync delay controls share one row to keep the
+	 * dock compact. ATEM sync delays the framing change after firing
+	 * the ATEM switch so both land on the same video frame in OBS. */
 	QHBoxLayout *durRow = new QHBoxLayout();
 	durRow->addWidget(new QLabel("Duration:"));
 	durationSpin = new QSpinBox();
@@ -54,6 +56,22 @@ void ShotPresetsDock::buildUI()
 	connect(durationSpin, QOverload<int>::of(&QSpinBox::valueChanged),
 		this, &ShotPresetsDock::onDurationChanged);
 	durRow->addWidget(durationSpin);
+
+	durRow->addSpacing(8);
+	durRow->addWidget(new QLabel("ATEM sync:"));
+	atemSyncSpin = new QSpinBox();
+	atemSyncSpin->setRange(0, 1000);
+	atemSyncSpin->setSuffix(" ms");
+	atemSyncSpin->setSingleStep(10);
+	atemSyncSpin->setSpecialValueText("(off)");
+	atemSyncSpin->setToolTip(
+		"Delay the framing change by this many ms after firing the "
+		"ATEM input switch so both land together in OBS. Tune to "
+		"USB capture latency + Render Delay filter time. 0 = off.");
+	atemSyncSpin->setValue(shot_presets_get_atem_sync_delay());
+	connect(atemSyncSpin, QOverload<int>::of(&QSpinBox::valueChanged),
+		this, &ShotPresetsDock::onAtemSyncDelayChanged);
+	durRow->addWidget(atemSyncSpin);
 	mainLayout->addLayout(durRow);
 
 	/* Empty-state label shown when no Shot Presets filter exists on
@@ -109,6 +127,15 @@ void ShotPresetsDock::refreshUI()
 	int dur = shot_presets_get_duration();
 	if (durationSpin->value() != dur)
 		durationSpin->setValue(dur);
+
+	/* Sync the ATEM-sync delay spinner without stealing focus */
+	if (atemSyncSpin && !atemSyncSpin->hasFocus()) {
+		int sync = shot_presets_get_atem_sync_delay();
+		if (atemSyncSpin->value() != sync) {
+			QSignalBlocker b(atemSyncSpin);
+			atemSyncSpin->setValue(sync);
+		}
+	}
 
 	/* Rebuild preset buttons if count changed */
 	if (count != presetRows.size()) {
@@ -311,6 +338,15 @@ void ShotPresetsDock::refreshUI()
 
 	/* Update button labels & spinbox values */
 	int defaultIdx = shot_presets_get_default_preset();
+	int currentIdx = shot_presets_get_current_preset();
+	const QString goBtnBase =
+		"QPushButton { font-size: 14px; font-weight: bold; padding: 6px 12px; }"
+		"QPushButton:disabled { color: #666; }";
+	const QString goBtnSelected =
+		"QPushButton { font-size: 14px; font-weight: bold; padding: 6px 12px; "
+		"background: #2c5fa6; color: #fff; "
+		"border: 1px solid #5a8fd6; }"
+		"QPushButton:disabled { color: #888; }";
 	for (int i = 0; i < count && i < presetRows.size(); i++) {
 		const char *name = shot_presets_get_name(i);
 		bool active = shot_presets_is_active(i);
@@ -319,6 +355,8 @@ void ShotPresetsDock::refreshUI()
 			.arg(name && name[0] ? name : "Untitled");
 		presetRows[i].goBtn->setText(label);
 		presetRows[i].goBtn->setEnabled(active);
+		presetRows[i].goBtn->setStyleSheet(
+			i == currentIdx ? goBtnSelected : goBtnBase);
 		presetRows[i].cutBtn->setEnabled(active);
 		if (presetRows[i].fadeBtn)
 			presetRows[i].fadeBtn->setEnabled(active);
@@ -485,6 +523,11 @@ void ShotPresetsDock::onCaptureClicked(int index)
 void ShotPresetsDock::onDurationChanged(int value)
 {
 	shot_presets_set_duration(value);
+}
+
+void ShotPresetsDock::onAtemSyncDelayChanged(int value)
+{
+	shot_presets_set_atem_sync_delay(value);
 }
 
 /* ── Registration ───────────────────────────────────────────── */

@@ -113,6 +113,23 @@ struct shot_presets_data {
 	int duration_ms;
 	int easing_type;
 	int easing_function;
+	int atem_sync_delay_ms;   /* hold sceneitem transform back this many
+	                           * ms after firing ATEM, so the OBS framing
+	                           * change lands together with the new ATEM
+	                           * video frame. Filter-global. 0 = disabled. */
+
+	/* Pending delayed apply for ATEM sync. When pending_kind != PENDING_NONE,
+	 * filter_tick increments pending_elapsed each frame; when it hits
+	 * atem_sync_delay_ms we apply the framing for pending_index using
+	 * the saved kind. The ATEM switch was already fired immediately. */
+	enum {
+		PENDING_NONE = 0,
+		PENDING_CUT,
+		PENDING_GO,
+	} pending_kind;
+	int   pending_index;
+	int   pending_transition_override; /* -1 = use preset's setting */
+	float pending_elapsed; /* seconds */
 
 	/* Hotkeys: registered MAX_PRESETS times at create. Callback resolves
 	 * to the active bucket and invokes the preset at that slot, so a
@@ -205,6 +222,8 @@ static char g_active_scene_name[SCENE_NAME_LEN] = "";
 void go_to_preset(struct shot_presets_data *d, int index);
 static void go_to_preset_override(struct shot_presets_data *d, int index,
                                    int transition_override);
+static void go_to_preset_internal(struct shot_presets_data *d, int index,
+                                   int transition_override, bool skip_atem);
 void cut_to_preset(struct shot_presets_data *d, int index);
 bool capture_transform(struct shot_presets_data *d, struct shot_preset *p);
 void save_presets(struct shot_presets_data *d, obs_data_t *settings);
@@ -563,6 +582,31 @@ void shot_presets_set_atem_input(int index, int input)
 int shot_presets_has_active(void)
 {
 	return g_active_instance ? 1 : 0;
+}
+
+int shot_presets_get_current_preset(void)
+{
+	if (!g_active_instance)
+		return -1;
+	struct shot_preset_bucket *b = peek_active_bucket(g_active_instance);
+	return b ? b->current_preset : -1;
+}
+
+int shot_presets_get_atem_sync_delay(void)
+{
+	return g_active_instance ? g_active_instance->atem_sync_delay_ms : 0;
+}
+
+void shot_presets_set_atem_sync_delay(int ms)
+{
+	if (!g_active_instance)
+		return;
+	if (ms < 0) ms = 0;
+	if (ms > 1000) ms = 1000;
+	g_active_instance->atem_sync_delay_ms = ms;
+	obs_data_t *settings = obs_source_get_settings(g_active_instance->source);
+	obs_data_set_int(settings, "atem_sync_delay_ms", ms);
+	obs_data_release(settings);
 }
 
 int shot_presets_get_default_preset(void)
@@ -1118,11 +1162,17 @@ static void normalize_preset_to_none(struct shot_preset *p,
 
 void go_to_preset(struct shot_presets_data *d, int index)
 {
-	go_to_preset_override(d, index, -1);
+	go_to_preset_internal(d, index, -1, false);
 }
 
 static void go_to_preset_override(struct shot_presets_data *d, int index,
                                    int transition_override)
+{
+	go_to_preset_internal(d, index, transition_override, false);
+}
+
+static void go_to_preset_internal(struct shot_presets_data *d, int index,
+                                   int transition_override, bool skip_atem)
 {
 	struct shot_preset_bucket *bk = active_bucket(d);
 	if (!bk) {
@@ -1130,6 +1180,25 @@ static void go_to_preset_override(struct shot_presets_data *d, int index,
 		     "[Shot Presets] go_to: no bucket available for scene '%s'",
 		     g_active_scene_name);
 		return;
+	}
+
+	/* ATEM sync: fire the switch immediately and defer the framing
+	 * animation by atem_sync_delay_ms so the move starts when the new
+	 * ATEM video frame actually reaches OBS. Only on the first entry —
+	 * filter_tick re-enters with skip_atem=true after the delay. */
+	if (!skip_atem && index >= 0 && index < bk->num_presets) {
+		int atem = bk->presets[index].atem_input;
+		fire_atem_program(atem);
+		if (atem >= 1 && d->atem_sync_delay_ms > 0) {
+			d->pending_kind = PENDING_GO;
+			d->pending_index = index;
+			d->pending_transition_override = transition_override;
+			d->pending_elapsed = 0.0f;
+			blog(LOG_INFO,
+			     "[Shot Presets] GO '%s' deferred by %d ms (ATEM sync)",
+			     bk->presets[index].name, d->atem_sync_delay_ms);
+			return;
+		}
 	}
 	if (index < 0 || index >= bk->num_presets) {
 		blog(LOG_WARNING,
@@ -1281,9 +1350,7 @@ static void go_to_preset_override(struct shot_presets_data *d, int index,
 	}
 
 	d->animating = true;
-	/* Fire ATEM switch alongside framing animation. Fire-and-forget so
-	 * a slow/down FNN runtime never stalls the frame-perfect transition. */
-	fire_atem_program(bk->presets[index].atem_input);
+	d->pending_kind = PENDING_NONE; /* clear any stale pending */
 	blog(LOG_INFO,
 	     "[Shot Presets] move START -> '%s' (%d ms)  "
 	     "from pos=(%.1f,%.1f) scale=(%.2f,%.2f) crop=(%d,%d,%d,%d) "
@@ -1326,6 +1393,23 @@ static void snap_to_preset_silent(struct shot_presets_data *d, int index)
 	apply_transform(d, &target, &target, 1.0f);
 }
 
+/* Inner cut: just applies the framing. No ATEM, no parking flags. Used
+ * by both the immediate path and the deferred (ATEM-sync-delay) path. */
+static void apply_cut_inner(struct shot_presets_data *d,
+                             struct shot_preset_bucket *bk, int index)
+{
+	struct shot_preset target = bk->presets[index];
+
+	obs_source_t *parent = obs_filter_get_parent(d->source);
+	if (parent) {
+		uint32_t sw = obs_source_get_width(parent);
+		uint32_t sh = obs_source_get_height(parent);
+		if (sw && sh)
+			normalize_preset_to_center(&target, sw, sh);
+	}
+	apply_transform(d, &target, &target, 1.0f);
+}
+
 void cut_to_preset(struct shot_presets_data *d, int index)
 {
 	struct shot_preset_bucket *bk = active_bucket(d);
@@ -1338,30 +1422,30 @@ void cut_to_preset(struct shot_presets_data *d, int index)
 	bk->current_preset = index;
 	bk->user_activated = true;
 	d->sync_dirty = false;
-	/* Fire ATEM switch alongside the cut. */
-	fire_atem_program(bk->presets[index].atem_input);
-	struct shot_preset target = bk->presets[index];
+	d->pending_kind = PENDING_NONE; /* cancel any prior pending */
 
-	obs_source_t *parent = obs_filter_get_parent(d->source);
-	if (parent) {
-		uint32_t sw = obs_source_get_width(parent);
-		uint32_t sh = obs_source_get_height(parent);
-		if (sw && sh)
-			normalize_preset_to_center(&target, sw, sh);
+	/* Fire ATEM switch first — its hardware/USB latency is what we're
+	 * trying to compensate for by deferring the framing change. */
+	int atem = bk->presets[index].atem_input;
+	fire_atem_program(atem);
+
+	if (atem >= 1 && d->atem_sync_delay_ms > 0) {
+		/* Defer the framing change so it lands together with the
+		 * new ATEM video frame in OBS. filter_tick will apply it
+		 * when pending_elapsed reaches atem_sync_delay_ms. */
+		d->pending_kind = PENDING_CUT;
+		d->pending_index = index;
+		d->pending_elapsed = 0.0f;
+		blog(LOG_INFO,
+		     "[Shot Presets] CUT '%s' deferred by %d ms (ATEM sync)",
+		     bk->presets[index].name, d->atem_sync_delay_ms);
+		return;
 	}
 
 	blog(LOG_INFO,
-	     "[Shot Presets] CUT '%s': pos=(%.1f,%.1f) scale=(%.3f,%.3f) "
-	     "rot=%.1f align=%u crop=(%d,%d,%d,%d) bounds_type=%d "
-	     "bounds=(%.1f,%.1f) b_align=%u",
-	     target.name, target.pos_x, target.pos_y,
-	     target.scale_x, target.scale_y,
-	     target.rotation, target.alignment,
-	     target.crop_left, target.crop_top,
-	     target.crop_right, target.crop_bottom,
-	     (int)target.bounds_type,
-	     target.bounds_x, target.bounds_y, target.bounds_align);
-	apply_transform(d, &target, &target, 1.0f);
+	     "[Shot Presets] CUT '%s' (immediate)",
+	     bk->presets[index].name);
+	apply_cut_inner(d, bk, index);
 }
 
 /* ── Hotkey callback ─────────────────────────────────────── */
@@ -1562,6 +1646,10 @@ static void *filter_create(obs_data_t *settings, obs_source_t *source)
 		d->duration_ms = 400;
 	d->easing_type = (int)obs_data_get_int(settings, "easing_type");
 	d->easing_function = (int)obs_data_get_int(settings, "easing_function");
+	d->atem_sync_delay_ms = (int)obs_data_get_int(settings, "atem_sync_delay_ms");
+	if (d->atem_sync_delay_ms < 0) d->atem_sync_delay_ms = 0;
+	if (d->atem_sync_delay_ms > 1000) d->atem_sync_delay_ms = 1000;
+	d->pending_kind = PENDING_NONE;
 
 	/* Enabled-scenes list. Prefer the explicit array if present;
 	 * fall back to legacy `home_scene` string for backward compat. */
@@ -1893,6 +1981,9 @@ static void filter_update(void *data, obs_data_t *settings)
 		d->duration_ms = 400;
 	d->easing_type = (int)obs_data_get_int(settings, "easing_type");
 	d->easing_function = (int)obs_data_get_int(settings, "easing_function");
+	d->atem_sync_delay_ms = (int)obs_data_get_int(settings, "atem_sync_delay_ms");
+	if (d->atem_sync_delay_ms < 0) d->atem_sync_delay_ms = 0;
+	if (d->atem_sync_delay_ms > 1000) d->atem_sync_delay_ms = 1000;
 
 	/* Rebuild the enabled-scenes list from per-scene checkbox state.
 	 * Every scene currently known to the frontend gets a `scene_enabled_<name>`
@@ -2013,6 +2104,36 @@ static void sync_sceneitem_to_parked_preset(struct shot_presets_data *d,
 static void filter_tick(void *data, float seconds)
 {
 	struct shot_presets_data *d = data;
+
+	/* ATEM-sync deferred apply. ATEM was already fired at click time;
+	 * after atem_sync_delay_ms elapses we apply the framing change so
+	 * it lands together with the new ATEM video frame in OBS. */
+	if (d->pending_kind != PENDING_NONE) {
+		d->pending_elapsed += seconds;
+		float threshold = (float)d->atem_sync_delay_ms / 1000.0f;
+		if (d->pending_elapsed >= threshold) {
+			int kind = d->pending_kind;
+			int idx = d->pending_index;
+			int over = d->pending_transition_override;
+			d->pending_kind = PENDING_NONE;
+			if (kind == PENDING_CUT) {
+				struct shot_preset_bucket *bk =
+					peek_active_bucket(d);
+				if (bk && idx >= 0 && idx < bk->num_presets &&
+				    bk->presets[idx].active) {
+					blog(LOG_INFO,
+					     "[Shot Presets] CUT '%s' applied "
+					     "(after %d ms ATEM sync)",
+					     bk->presets[idx].name,
+					     d->atem_sync_delay_ms);
+					apply_cut_inner(d, bk, idx);
+				}
+			} else if (kind == PENDING_GO) {
+				go_to_preset_internal(d, idx, over,
+				                       true /* skip_atem */);
+			}
+		}
+	}
 
 	if (!d->animating) {
 		sync_sceneitem_to_parked_preset(d, seconds);
