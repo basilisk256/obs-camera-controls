@@ -1,0 +1,13 @@
+# CMake build output
+build/
+.deps/
+cmake/.CMakeBuildNumber
+
+# IDE
+.vs/
+.vscode/
+*.user
+
+# OS
+Thumbs.db
+.DS_Store

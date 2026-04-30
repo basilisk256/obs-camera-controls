@@ -8,12 +8,8 @@
 #include <string.h>
 #include "easing.h"
 #include "shot-presets-shared.h"
+#include "atem-control.h"
 #include "version.h"
-
-#ifdef _WIN32
-#include <windows.h>
-#include <winhttp.h>
-#endif
 
 /* ================================================================
  *  Shot Presets — OBS Filter Plugin
@@ -306,72 +302,20 @@ static struct shot_preset_bucket *peek_active_bucket(
 	return find_bucket(d, g_active_scene_name);
 }
 
-/* ── ATEM trigger via FNN runtime ─────────────────────────────
- * Fire-and-forget HTTP POST to http://127.0.0.1:4173/api/runtime/atem/
- * program/<N>. The actual ATEM switch is done by the FNN runtime, which
- * already owns the BMD ATEM connection. We just kick off a request from
- * a detached thread so the framing animation isn't blocked on network
- * I/O. If the FNN runtime isn't running, the connect fails silently. */
-
-#ifdef _WIN32
-static DWORD WINAPI atem_post_thread(LPVOID lpParam)
-{
-	int input = (int)(intptr_t)lpParam;
-	if (input < 1)
-		return 0;
-	HINTERNET hSession = WinHttpOpen(L"obs-shot-presets/1.0",
-		WINHTTP_ACCESS_TYPE_NO_PROXY,
-		WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-	if (!hSession)
-		return 0;
-	/* Tight timeouts — we don't want a stuck request piling up threads.
-	 * resolve, connect, send, receive — all in milliseconds. */
-	WinHttpSetTimeouts(hSession, 1500, 1500, 1500, 1500);
-	HINTERNET hConnect = WinHttpConnect(hSession, L"127.0.0.1", 4173, 0);
-	if (!hConnect) {
-		WinHttpCloseHandle(hSession);
-		return 0;
-	}
-	wchar_t path[64];
-	_snwprintf_s(path, 64, _TRUNCATE,
-	             L"/api/runtime/atem/program/%d", input);
-	HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"POST", path,
-		NULL, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, 0);
-	if (!hRequest) {
-		WinHttpCloseHandle(hConnect);
-		WinHttpCloseHandle(hSession);
-		return 0;
-	}
-	BOOL sent = WinHttpSendRequest(hRequest,
-		WINHTTP_NO_ADDITIONAL_HEADERS, 0,
-		WINHTTP_NO_REQUEST_DATA, 0, 0, 0);
-	if (sent)
-		WinHttpReceiveResponse(hRequest, NULL);
-	WinHttpCloseHandle(hRequest);
-	WinHttpCloseHandle(hConnect);
-	WinHttpCloseHandle(hSession);
-	return 0;
-}
-#endif
-
+/* ── ATEM trigger ─────────────────────────────────────────────
+ * Direct in-process control via the BMD ATEM Switchers SDK. The actual
+ * COM work happens on a dedicated worker thread (see atem-control.cpp);
+ * this is just a non-blocking enqueue from the OBS render/frontend
+ * threads. */
 static void fire_atem_program(int input)
 {
 	if (input < 1)
 		return;
-#ifdef _WIN32
-	HANDLE h = CreateThread(NULL, 0, atem_post_thread,
-	                        (LPVOID)(intptr_t)input, 0, NULL);
-	if (h)
-		CloseHandle(h);
+	atem_set_program_input(input);
 	blog(LOG_INFO,
-	     "[Shot Presets] ATEM trigger: program input %d (fire-and-forget POST)",
-	     input);
-#else
-	blog(LOG_WARNING,
-	     "[Shot Presets] ATEM trigger requested for input %d but this "
-	     "build is non-Windows (WinHTTP not available)",
-	     input);
-#endif
+	     "[Shot Presets] ATEM trigger: program input %d (queued, "
+	     "connected=%d)",
+	     input, atem_is_connected());
 }
 
 /* ── Shared API for the dock ─────────────────────────────── */
@@ -2491,6 +2435,7 @@ bool obs_module_load(void)
 	obs_register_source(&shot_presets_filter_info);
 	shot_presets_dock_init();
 	obs_frontend_add_event_callback(on_scene_changed, NULL);
+	atem_init();
 	blog(LOG_INFO, "[Shot Presets] Plugin loaded (version %s)",
 	     PROJECT_VERSION);
 	return true;
@@ -2498,5 +2443,6 @@ bool obs_module_load(void)
 
 void obs_module_unload(void)
 {
+	atem_shutdown();
 	blog(LOG_INFO, "[Shot Presets] Plugin unloaded");
 }
