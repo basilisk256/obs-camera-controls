@@ -121,7 +121,9 @@ struct shot_presets_data {
 	/* Pending delayed apply for ATEM sync. When pending_kind != PENDING_NONE,
 	 * filter_tick increments pending_elapsed each frame; when it hits
 	 * atem_sync_delay_ms we apply the framing for pending_index using
-	 * the saved kind. The ATEM switch was already fired immediately. */
+	 * the saved kind. The ATEM switch was already fired immediately.
+	 * pending_scene guards against the user switching scenes inside the
+	 * delay window — we only apply if the active scene still matches. */
 	enum {
 		PENDING_NONE = 0,
 		PENDING_CUT,
@@ -130,6 +132,7 @@ struct shot_presets_data {
 	int   pending_index;
 	int   pending_transition_override; /* -1 = use preset's setting */
 	float pending_elapsed; /* seconds */
+	char  pending_scene[SCENE_NAME_LEN];
 
 	/* Hotkeys: registered MAX_PRESETS times at create. Callback resolves
 	 * to the active bucket and invokes the preset at that slot, so a
@@ -565,18 +568,34 @@ int shot_presets_get_atem_input(int index)
 
 void shot_presets_set_atem_input(int index, int input)
 {
-	if (!g_active_instance)
+	if (!g_active_instance) {
+		blog(LOG_WARNING,
+		     "[Shot Presets] set_atem_input(%d, %d): no active instance",
+		     index, input);
 		return;
+	}
 	struct shot_presets_data *d = g_active_instance;
 	struct shot_preset_bucket *b = active_bucket(d);
-	if (!b || index < 0 || index >= b->num_presets)
+	if (!b || index < 0 || index >= b->num_presets) {
+		blog(LOG_WARNING,
+		     "[Shot Presets] set_atem_input(%d, %d): bad bucket/index "
+		     "(scene='%s' bucket=%s num_presets=%d)",
+		     index, input, g_active_scene_name,
+		     b ? b->scene_name : "(null)",
+		     b ? b->num_presets : -1);
 		return;
+	}
 	if (input < 0) input = 0;
 	if (input > 8) input = 8;
 	b->presets[index].atem_input = input;
 	obs_data_t *settings = obs_source_get_settings(d->source);
 	save_presets(d, settings);
 	obs_data_release(settings);
+	blog(LOG_INFO,
+	     "[Shot Presets] set_atem_input: bucket='%s' preset[%d '%s'] "
+	     "atem_input=%d (saved)",
+	     b->scene_name[0] ? b->scene_name : "(default)",
+	     index, b->presets[index].name, input);
 }
 
 int shot_presets_has_active(void)
@@ -1194,9 +1213,13 @@ static void go_to_preset_internal(struct shot_presets_data *d, int index,
 			d->pending_index = index;
 			d->pending_transition_override = transition_override;
 			d->pending_elapsed = 0.0f;
+			snprintf(d->pending_scene, sizeof(d->pending_scene),
+			         "%s", g_active_scene_name);
 			blog(LOG_INFO,
-			     "[Shot Presets] GO '%s' deferred by %d ms (ATEM sync)",
-			     bk->presets[index].name, d->atem_sync_delay_ms);
+			     "[Shot Presets] GO '%s' deferred by %d ms (ATEM "
+			     "sync, scene='%s')",
+			     bk->presets[index].name, d->atem_sync_delay_ms,
+			     d->pending_scene);
 			return;
 		}
 	}
@@ -1432,13 +1455,19 @@ void cut_to_preset(struct shot_presets_data *d, int index)
 	if (atem >= 1 && d->atem_sync_delay_ms > 0) {
 		/* Defer the framing change so it lands together with the
 		 * new ATEM video frame in OBS. filter_tick will apply it
-		 * when pending_elapsed reaches atem_sync_delay_ms. */
+		 * when pending_elapsed reaches atem_sync_delay_ms.
+		 * Snapshot the active scene name so we don't mis-apply if
+		 * the user switches scenes inside the delay window. */
 		d->pending_kind = PENDING_CUT;
 		d->pending_index = index;
 		d->pending_elapsed = 0.0f;
+		snprintf(d->pending_scene, sizeof(d->pending_scene), "%s",
+		         g_active_scene_name);
 		blog(LOG_INFO,
-		     "[Shot Presets] CUT '%s' deferred by %d ms (ATEM sync)",
-		     bk->presets[index].name, d->atem_sync_delay_ms);
+		     "[Shot Presets] CUT '%s' deferred by %d ms (ATEM sync, "
+		     "scene='%s')",
+		     bk->presets[index].name, d->atem_sync_delay_ms,
+		     d->pending_scene);
 		return;
 	}
 
@@ -1540,9 +1569,11 @@ void save_presets(struct shot_presets_data *d, obs_data_t *settings)
 			for (int j = 0; j < bk->num_presets; j++) {
 				if (j > 0) dstr_cat(&presets_str, ", ");
 				char tmp[256];
-				snprintf(tmp, sizeof(tmp), "[%d]'%s'%s",
+				snprintf(tmp, sizeof(tmp),
+				         "[%d]'%s'%s atem=%d",
 				         j, bk->presets[j].name,
-				         bk->presets[j].active ? "" : "(empty)");
+				         bk->presets[j].active ? "" : "(empty)",
+				         bk->presets[j].atem_input);
 				dstr_cat(&presets_str, tmp);
 			}
 			blog(LOG_INFO,
@@ -1817,9 +1848,11 @@ static void *filter_create(obs_data_t *settings, obs_source_t *source)
 			for (int j = 0; j < bk->num_presets; j++) {
 				if (j > 0) dstr_cat(&presets_str, ", ");
 				char tmp[256];
-				snprintf(tmp, sizeof(tmp), "[%d]'%s'%s",
+				snprintf(tmp, sizeof(tmp),
+				         "[%d]'%s'%s atem=%d",
 				         j, bk->presets[j].name,
-				         bk->presets[j].active ? "" : "(empty)");
+				         bk->presets[j].active ? "" : "(empty)",
+				         bk->presets[j].atem_input);
 				dstr_cat(&presets_str, tmp);
 			}
 			blog(LOG_INFO,
@@ -2116,16 +2149,28 @@ static void filter_tick(void *data, float seconds)
 			int idx = d->pending_index;
 			int over = d->pending_transition_override;
 			d->pending_kind = PENDING_NONE;
-			if (kind == PENDING_CUT) {
+
+			/* Guard: if the user switched scenes inside the
+			 * delay window, drop the apply rather than write
+			 * the wrong bucket. */
+			if (strcmp(d->pending_scene,
+			           g_active_scene_name) != 0) {
+				blog(LOG_WARNING,
+				     "[Shot Presets] pending apply DROPPED — "
+				     "scene changed during sync delay (was "
+				     "'%s', now '%s')",
+				     d->pending_scene, g_active_scene_name);
+			} else if (kind == PENDING_CUT) {
 				struct shot_preset_bucket *bk =
 					peek_active_bucket(d);
 				if (bk && idx >= 0 && idx < bk->num_presets &&
 				    bk->presets[idx].active) {
 					blog(LOG_INFO,
 					     "[Shot Presets] CUT '%s' applied "
-					     "(after %d ms ATEM sync)",
+					     "(after %d ms ATEM sync, scene='%s')",
 					     bk->presets[idx].name,
-					     d->atem_sync_delay_ms);
+					     d->atem_sync_delay_ms,
+					     bk->scene_name);
 					apply_cut_inner(d, bk, idx);
 				}
 			} else if (kind == PENDING_GO) {
@@ -2453,9 +2498,11 @@ static void update_active_for_current_scene(void)
 			for (int j = 0; j < bk->num_presets; j++) {
 				if (j > 0) dstr_cat(&presets_str, ", ");
 				char tmp[256];
-				snprintf(tmp, sizeof(tmp), "[%d]'%s'%s",
+				snprintf(tmp, sizeof(tmp),
+				         "[%d]'%s'%s atem=%d",
 				         j, bk->presets[j].name,
-				         bk->presets[j].active ? "" : "(empty)");
+				         bk->presets[j].active ? "" : "(empty)",
+				         bk->presets[j].atem_input);
 				dstr_cat(&presets_str, tmp);
 			}
 		}
