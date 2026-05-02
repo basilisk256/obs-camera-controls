@@ -1270,7 +1270,9 @@ static void go_to_preset_internal(struct shot_presets_data *d, int index,
 
 	d->to = bk->presets[index];
 	bk->current_preset = index;
-	bk->user_activated = true;
+	/* user_activated intentionally NOT set — see sync_sceneitem_to_parked_preset
+	 * comment. Live-edit-while-parked sync is disabled; Save is the only
+	 * write path. */
 	d->sync_dirty = false;
 	d->running_duration = 0.0f;
 	d->active_duration_ms = bk->presets[index].duration_ms > 0
@@ -1448,7 +1450,10 @@ void cut_to_preset(struct shot_presets_data *d, int index)
 
 	d->animating = false;
 	bk->current_preset = index;
-	bk->user_activated = true;
+	/* user_activated intentionally NOT set — live-edit-while-parked sync
+	 * is disabled (see sync_sceneitem_to_parked_preset). Save is the only
+	 * write path; clicking a preset is purely a "go to this framing"
+	 * action and never modifies the preset. */
 	d->sync_dirty = false;
 	d->pending_kind = PENDING_NONE; /* cancel any prior pending */
 
@@ -2067,77 +2072,12 @@ static void filter_update(void *data, obs_data_t *settings)
 
 /* ── video_tick — runs every frame (30/60fps) ────────────── */
 
-/* Compare transform fields between a captured sceneitem state and a
- * stored preset. Returns true if they differ enough to warrant a save. */
-static bool sceneitem_differs_from_preset(const struct shot_preset *live,
-                                           const struct shot_preset *stored)
-{
-	const float eps = 0.5f;
-	if (fabsf(live->pos_x   - stored->pos_x)   > eps) return true;
-	if (fabsf(live->pos_y   - stored->pos_y)   > eps) return true;
-	if (fabsf(live->scale_x - stored->scale_x) > 0.001f) return true;
-	if (fabsf(live->scale_y - stored->scale_y) > 0.001f) return true;
-	if (fabsf(live->rotation - stored->rotation) > 0.01f) return true;
-	if (live->alignment    != stored->alignment)    return true;
-	if (live->crop_left    != stored->crop_left)    return true;
-	if (live->crop_top     != stored->crop_top)     return true;
-	if (live->crop_right   != stored->crop_right)   return true;
-	if (live->crop_bottom  != stored->crop_bottom)  return true;
-	if (live->bounds_type  != stored->bounds_type)  return true;
-	if (fabsf(live->bounds_x - stored->bounds_x) > eps) return true;
-	if (fabsf(live->bounds_y - stored->bounds_y) > eps) return true;
-	if (live->bounds_align != stored->bounds_align) return true;
-	return false;
-}
-
-/* Pull the sceneitem's current transform into the parked preset. */
-static void sync_sceneitem_to_parked_preset(struct shot_presets_data *d,
-                                              float seconds)
-{
-	if (d->animating)
-		return;
-	struct shot_preset_bucket *bk = peek_active_bucket(d);
-	if (!bk || !bk->user_activated)
-		return;
-	if (bk->current_preset < 0 || bk->current_preset >= bk->num_presets)
-		return;
-
-	struct shot_preset *p = &bk->presets[bk->current_preset];
-	if (!p->active)
-		return;
-
-	struct shot_preset live = {0};
-	if (!capture_transform(d, &live))
-		return;
-
-	if (sceneitem_differs_from_preset(&live, p)) {
-		p->pos_x   = live.pos_x;
-		p->pos_y   = live.pos_y;
-		p->scale_x = live.scale_x;
-		p->scale_y = live.scale_y;
-		p->rotation = live.rotation;
-		p->alignment = live.alignment;
-		p->crop_left   = live.crop_left;
-		p->crop_top    = live.crop_top;
-		p->crop_right  = live.crop_right;
-		p->crop_bottom = live.crop_bottom;
-		p->bounds_type = live.bounds_type;
-		p->bounds_x    = live.bounds_x;
-		p->bounds_y    = live.bounds_y;
-		p->bounds_align = live.bounds_align;
-		d->sync_dirty = true;
-	}
-
-	/* Debounce disk writes so rapid drags don't hammer settings. */
-	d->sync_debounce += seconds;
-	if (d->sync_dirty && d->sync_debounce > 0.4f) {
-		obs_data_t *settings = obs_source_get_settings(d->source);
-		save_presets(d, settings);
-		obs_data_release(settings);
-		d->sync_dirty = false;
-		d->sync_debounce = 0.0f;
-	}
-}
+/* (sync_sceneitem_to_parked_preset and sceneitem_differs_from_preset
+ * removed. The "live-edit-while-parked" auto-sync — drag in OBS preview
+ * silently writes the live transform back into the most-recent-clicked
+ * preset — corrupted user data repeatedly. Real users dragged between
+ * cuts to compare framings, not to refine the previous one, and lost
+ * their saved presets every time. Save is now the only write path.) */
 
 static void filter_tick(void *data, float seconds)
 {
@@ -2186,7 +2126,15 @@ static void filter_tick(void *data, float seconds)
 	}
 
 	if (!d->animating) {
-		sync_sceneitem_to_parked_preset(d, seconds);
+		/* sync_sceneitem_to_parked_preset is intentionally NOT called
+		 * here. The "live-edit-while-parked" auto-sync (drag in OBS
+		 * preview → silently overwrite the most-recent-clicked preset)
+		 * was a footgun: every drag between cuts/gos/captures
+		 * corrupted whichever preset was last "parked" on. Real users
+		 * dragged to TEST framings, not to refine, and lost their
+		 * saved data repeatedly. Save is now the only write path —
+		 * if you want to refine a preset, drag and click Save. */
+		(void)seconds;
 		return;
 	}
 
