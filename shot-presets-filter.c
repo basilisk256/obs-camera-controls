@@ -1209,10 +1209,33 @@ static void go_to_preset_internal(struct shot_presets_data *d, int index,
 	/* ATEM sync: fire the switch immediately and defer the framing
 	 * animation by atem_sync_delay_ms so the move starts when the new
 	 * ATEM video frame actually reaches OBS. Only on the first entry —
-	 * filter_tick re-enters with skip_atem=true after the delay. */
+	 * filter_tick re-enters with skip_atem=true after the delay.
+	 *
+	 * Special case: FADE transition uses an ATEM hardware mix transition
+	 * (cross-fade between cameras) instead of a hard cut, so the camera
+	 * change matches the framing fade visually. Other transitions (Move,
+	 * Cut) use a hard cut on the ATEM. */
 	if (!skip_atem && index >= 0 && index < bk->num_presets) {
 		int atem = bk->presets[index].atem_input;
-		fire_atem_program(atem);
+		int eff_t = (transition_override >= 0)
+			? transition_override
+			: bk->presets[index].transition_type;
+		if (atem >= 1 && eff_t == SHOT_TRANSITION_FADE) {
+			int dur_ms = bk->presets[index].duration_ms > 0
+				? bk->presets[index].duration_ms
+				: d->duration_ms;
+			if (dur_ms < 50) dur_ms = 400;
+			/* ATEM mix rate is in ATEM frames; assume 30fps. */
+			int frames = (dur_ms + 16) / 33;
+			if (frames < 1) frames = 1;
+			atem_perform_mix_transition(atem, frames);
+			blog(LOG_INFO,
+			     "[Shot Presets] ATEM mix transition queued: "
+			     "input=%d frames=%d (dur=%dms)",
+			     atem, frames, dur_ms);
+		} else {
+			fire_atem_program(atem);
+		}
 		if (atem >= 1 && d->atem_sync_delay_ms > 0) {
 			d->pending_kind = PENDING_GO;
 			d->pending_index = index;

@@ -29,6 +29,14 @@ void atem_shutdown(void);
  * worker thread. input <= 0 is a no-op. */
 void atem_set_program_input(int input);
 
+/* Queue a hardware mix (cross-fade) transition to the given input over
+ * `duration_frames` ATEM frames (typically 30fps). Sets transition
+ * style to Mix, sets preview input, then calls PerformAutoTransition.
+ * Used for Fade-mode shot presets so the camera change is a hardware
+ * crossfade instead of a hard cut. input <= 0 is a no-op; if duration
+ * <= 0 the function falls back to a hard cut. */
+void atem_perform_mix_transition(int input, int duration_frames);
+
 /* 1 if currently connected to a switcher, 0 otherwise. Lock-free read. */
 int atem_is_connected(void);
 

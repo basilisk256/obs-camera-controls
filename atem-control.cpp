@@ -32,6 +32,12 @@
 namespace {
 
 #ifdef _WIN32
+struct AtemRequest {
+	enum Kind { CUT, MIX } kind;
+	int input;
+	int duration_frames; /* MIX only */
+};
+
 class AtemWorker {
 public:
 	AtemWorker() = default;
@@ -56,26 +62,42 @@ public:
 			thread_.join();
 	}
 
-	void enqueue(int input)
+	void enqueueCut(int input)
 	{
 		if (input <= 0)
 			return;
-		{
-			std::lock_guard<std::mutex> lock(mutex_);
-			/* Coalesce: if multiple requests pile up faster than
-			 * we can dispatch, only the latest matters. The user
-			 * pressed N most recently; intermediate inputs are
-			 * irrelevant for a video switch. */
-			while (!queue_.empty())
-				queue_.pop();
-			queue_.push(input);
-		}
-		cv_.notify_one();
+		AtemRequest r{AtemRequest::CUT, input, 0};
+		push(r);
+	}
+
+	void enqueueMix(int input, int duration_frames)
+	{
+		if (input <= 0)
+			return;
+		if (duration_frames < 1)
+			duration_frames = 1;
+		if (duration_frames > 250) /* ATEM max is 250 frames */
+			duration_frames = 250;
+		AtemRequest r{AtemRequest::MIX, input, duration_frames};
+		push(r);
 	}
 
 	bool isConnected() const { return connected_.load(); }
 
 private:
+	void push(const AtemRequest &r)
+	{
+		{
+			std::lock_guard<std::mutex> lock(mutex_);
+			/* Coalesce: if multiple requests pile up faster than
+			 * we can dispatch, only the latest matters. */
+			while (!queue_.empty())
+				queue_.pop();
+			queue_.push(r);
+		}
+		cv_.notify_one();
+	}
+
 	void run()
 	{
 		HRESULT comInit = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
@@ -93,7 +115,7 @@ private:
 			     err.c_str());
 
 		while (running_.load()) {
-			int input = -1;
+			AtemRequest req{AtemRequest::CUT, 0, 0};
 			{
 				std::unique_lock<std::mutex> lock(mutex_);
 				cv_.wait(lock, [this]() {
@@ -102,11 +124,11 @@ private:
 				});
 				if (!running_.load())
 					break;
-				input = queue_.front();
+				req = queue_.front();
 				queue_.pop();
 			}
 
-			if (input <= 0)
+			if (req.input <= 0)
 				continue;
 
 			if (!connected_.load()) {
@@ -115,24 +137,39 @@ private:
 					blog(LOG_WARNING,
 					     "[Shot Presets] ATEM switch to %d "
 					     "skipped — connect failed: %s",
-					     input, e.c_str());
+					     req.input, e.c_str());
 					continue;
 				}
 			}
 
-			HRESULT hr = mixEffectBlock_->SetProgramInput(
-				static_cast<BMDSwitcherInputId>(input));
+			HRESULT hr;
+			const char *opName;
+			if (req.kind == AtemRequest::MIX) {
+				hr = performMix(req.input,
+				                 req.duration_frames);
+				opName = "PerformAutoTransition(MIX)";
+			} else {
+				hr = mixEffectBlock_->SetProgramInput(
+					static_cast<BMDSwitcherInputId>(
+						req.input));
+				opName = "SetProgramInput";
+			}
 			if (FAILED(hr)) {
 				blog(LOG_WARNING,
-				     "[Shot Presets] ATEM SetProgramInput(%d) "
-				     "failed: hr=0x%lx — disconnecting for "
-				     "retry on next trigger",
-				     input, (long)hr);
+				     "[Shot Presets] ATEM %s(%d) failed: "
+				     "hr=0x%lx — disconnecting for retry on "
+				     "next trigger",
+				     opName, req.input, (long)hr);
 				disconnect();
+			} else if (req.kind == AtemRequest::MIX) {
+				blog(LOG_INFO,
+				     "[Shot Presets] ATEM mix transition -> %d "
+				     "(%d frames)",
+				     req.input, req.duration_frames);
 			} else {
 				blog(LOG_INFO,
 				     "[Shot Presets] ATEM program input -> %d",
-				     input);
+				     req.input);
 			}
 		}
 
@@ -140,6 +177,42 @@ private:
 		if (SUCCEEDED(comInit))
 			CoUninitialize();
 		blog(LOG_INFO, "[Shot Presets] ATEM worker thread stopped");
+	}
+
+	HRESULT performMix(int input, int durationFrames)
+	{
+		if (!mixEffectBlock_)
+			return E_POINTER;
+
+		IBMDSwitcherTransitionParameters *txParams = nullptr;
+		HRESULT hr = mixEffectBlock_->QueryInterface(
+			IID_IBMDSwitcherTransitionParameters,
+			reinterpret_cast<void **>(&txParams));
+		if (FAILED(hr) || !txParams)
+			return FAILED(hr) ? hr : E_POINTER;
+		hr = txParams->SetNextTransitionStyle(
+			bmdSwitcherTransitionStyleMix);
+		txParams->Release();
+		if (FAILED(hr))
+			return hr;
+
+		IBMDSwitcherTransitionMixParameters *mixParams = nullptr;
+		hr = mixEffectBlock_->QueryInterface(
+			IID_IBMDSwitcherTransitionMixParameters,
+			reinterpret_cast<void **>(&mixParams));
+		if (FAILED(hr) || !mixParams)
+			return FAILED(hr) ? hr : E_POINTER;
+		hr = mixParams->SetRate(static_cast<uint32_t>(durationFrames));
+		mixParams->Release();
+		if (FAILED(hr))
+			return hr;
+
+		hr = mixEffectBlock_->SetPreviewInput(
+			static_cast<BMDSwitcherInputId>(input));
+		if (FAILED(hr))
+			return hr;
+
+		return mixEffectBlock_->PerformAutoTransition();
 	}
 
 	bool connect(std::string &error)
@@ -214,7 +287,7 @@ private:
 	std::thread thread_;
 	std::mutex mutex_;
 	std::condition_variable cv_;
-	std::queue<int> queue_;
+	std::queue<AtemRequest> queue_;
 
 	IBMDSwitcherDiscovery *discovery_ = nullptr;
 	IBMDSwitcher *switcher_ = nullptr;
@@ -245,9 +318,19 @@ void atem_shutdown(void)
 void atem_set_program_input(int input)
 {
 #ifdef _WIN32
-	g_worker.enqueue(input);
+	g_worker.enqueueCut(input);
 #else
 	(void)input;
+#endif
+}
+
+void atem_perform_mix_transition(int input, int duration_frames)
+{
+#ifdef _WIN32
+	g_worker.enqueueMix(input, duration_frames);
+#else
+	(void)input;
+	(void)duration_frames;
 #endif
 }
 
