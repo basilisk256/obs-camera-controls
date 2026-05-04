@@ -40,6 +40,14 @@ void atem_perform_mix_transition(int input, int duration_frames);
 /* 1 if currently connected to a switcher, 0 otherwise. Lock-free read. */
 int atem_is_connected(void);
 
+/* The most recent program input we asked the ATEM to switch to (via
+ * either atem_set_program_input or atem_perform_mix_transition).
+ * Initialised to whatever GetProgramInput reports on connect. -1 if
+ * never set / not connected. Used to detect "same-input fade" so we
+ * can skip a no-op ATEM mix and let the OBS-side cross-dissolve run
+ * instead. */
+int atem_get_last_program_input(void);
+
 #ifdef __cplusplus
 }
 #endif

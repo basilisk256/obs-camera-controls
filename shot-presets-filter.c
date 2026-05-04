@@ -450,6 +450,9 @@ void shot_presets_set_duration(int ms)
 	if (ms < 50)
 		ms = 400;
 	g_active_instance->duration_ms = ms;
+	obs_data_t *settings = obs_source_get_settings(g_active_instance->source);
+	save_presets(g_active_instance, settings);
+	obs_data_release(settings);
 }
 
 int shot_presets_get_fade_duration(void)
@@ -465,7 +468,7 @@ void shot_presets_set_fade_duration(int ms)
 	if (ms > 5000) ms = 5000;
 	g_active_instance->fade_duration_ms = ms;
 	obs_data_t *settings = obs_source_get_settings(g_active_instance->source);
-	obs_data_set_int(settings, "fade_duration", ms);
+	save_presets(g_active_instance, settings);
 	obs_data_release(settings);
 }
 
@@ -661,7 +664,7 @@ void shot_presets_set_atem_sync_delay(int ms)
 	if (ms > 1000) ms = 1000;
 	g_active_instance->atem_sync_delay_ms = ms;
 	obs_data_t *settings = obs_source_get_settings(g_active_instance->source);
-	obs_data_set_int(settings, "atem_sync_delay_ms", ms);
+	save_presets(g_active_instance, settings);
 	obs_data_release(settings);
 }
 
@@ -678,7 +681,7 @@ void shot_presets_set_fade_sync_delay(int ms)
 	if (ms > 1000) ms = 1000;
 	g_active_instance->fade_sync_delay_ms = ms;
 	obs_data_t *settings = obs_source_get_settings(g_active_instance->source);
-	obs_data_set_int(settings, "fade_sync_delay_ms", ms);
+	save_presets(g_active_instance, settings);
 	obs_data_release(settings);
 }
 
@@ -1269,14 +1272,22 @@ static void go_to_preset_internal(struct shot_presets_data *d, int index,
 		int eff_t = (transition_override >= 0)
 			? transition_override
 			: bk->presets[index].transition_type;
-		if (atem >= 1 && eff_t == SHOT_TRANSITION_FADE) {
-			/* FADE + ATEM input: use the ATEM hardware mix
-			 * transition for the camera crossfade. The OBS
-			 * framing change is a CUT (not an animation, not a
-			 * cross-dissolve), scheduled to land at the midpoint
-			 * of the ATEM crossfade in OBS so the framing snap
-			 * is hidden in the busiest visible moment of the
-			 * camera fade. No intermediate framings visible. */
+		/* If FADE + ATEM but the target ATEM input is the same as
+		 * the current program input, the hardware mix would be a
+		 * no-op (same camera blending into itself). Fall through to
+		 * the OBS-side cross-dissolve so the user still sees a fade
+		 * between the two framings of the same camera. */
+		bool atem_same_input = (atem >= 1) &&
+			(atem_get_last_program_input() == atem);
+		if (atem >= 1 && eff_t == SHOT_TRANSITION_FADE && !atem_same_input) {
+			/* FADE + ATEM input (different from current): use the
+			 * ATEM hardware mix transition for the camera
+			 * crossfade. The OBS framing change is a CUT (not an
+			 * animation, not a cross-dissolve), scheduled to land
+			 * at the midpoint of the ATEM crossfade in OBS so the
+			 * framing snap is hidden in the busiest visible
+			 * moment of the camera fade. No intermediate framings
+			 * visible. */
 			int dur_ms = bk->presets[index].duration_ms > 0
 				? bk->presets[index].duration_ms
 				: d->fade_duration_ms;
@@ -1306,29 +1317,41 @@ static void go_to_preset_internal(struct shot_presets_data *d, int index,
 			return;
 		}
 
-		fire_atem_program(atem);
-		/* Pick the appropriate sync delay for the transition kind:
-		 * fades use fade_sync_delay_ms (typically lower because the
-		 * framing fade should *start* when the ATEM crossfade start
-		 * is visible), cuts/moves use atem_sync_delay_ms. */
-		int eff_sync_delay = (eff_t == SHOT_TRANSITION_FADE)
-			? d->fade_sync_delay_ms
-			: d->atem_sync_delay_ms;
-		if (atem >= 1 && eff_sync_delay > 0) {
-			d->pending_kind = PENDING_GO;
-			d->pending_index = index;
-			d->pending_transition_override = transition_override;
-			d->pending_elapsed = 0.0f;
-			d->pending_sync_delay_ms = eff_sync_delay;
-			snprintf(d->pending_scene, sizeof(d->pending_scene),
-			         "%s", g_active_scene_name);
+		/* Same-input fade: skip ATEM entirely and fall through to
+		 * the OBS-side cross-dissolve (which handles framing fades
+		 * on a single source). No defer either — there's no ATEM
+		 * video lag to compensate for since the input didn't change. */
+		if (atem_same_input && eff_t == SHOT_TRANSITION_FADE) {
 			blog(LOG_INFO,
-			     "[Shot Presets] GO '%s' deferred by %d ms (%s sync, "
-			     "scene='%s')",
-			     bk->presets[index].name, eff_sync_delay,
-			     eff_t == SHOT_TRANSITION_FADE ? "FADE" : "ATEM",
-			     d->pending_scene);
-			return;
+			     "[Shot Presets] FADE '%s' on same ATEM input %d — "
+			     "no hardware mix, using OBS cross-dissolve",
+			     bk->presets[index].name, atem);
+		} else {
+			fire_atem_program(atem);
+			/* Pick the appropriate sync delay for the transition
+			 * kind: fades use fade_sync_delay_ms (typically lower
+			 * because the framing fade should *start* when the
+			 * ATEM crossfade start is visible), cuts/moves use
+			 * atem_sync_delay_ms. */
+			int eff_sync_delay = (eff_t == SHOT_TRANSITION_FADE)
+				? d->fade_sync_delay_ms
+				: d->atem_sync_delay_ms;
+			if (atem >= 1 && eff_sync_delay > 0) {
+				d->pending_kind = PENDING_GO;
+				d->pending_index = index;
+				d->pending_transition_override = transition_override;
+				d->pending_elapsed = 0.0f;
+				d->pending_sync_delay_ms = eff_sync_delay;
+				snprintf(d->pending_scene, sizeof(d->pending_scene),
+				         "%s", g_active_scene_name);
+				blog(LOG_INFO,
+				     "[Shot Presets] GO '%s' deferred by %d ms (%s sync, "
+				     "scene='%s')",
+				     bk->presets[index].name, eff_sync_delay,
+				     eff_t == SHOT_TRANSITION_FADE ? "FADE" : "ATEM",
+				     d->pending_scene);
+				return;
+			}
 		}
 	}
 	if (index < 0 || index >= bk->num_presets) {
@@ -1665,6 +1688,17 @@ void save_presets(struct shot_presets_data *d, obs_data_t *settings)
 	}
 	obs_data_set_array(settings, "scene_buckets", barr);
 	obs_data_array_release(barr);
+
+	/* Write the global filter settings from the in-memory data struct
+	 * into the settings dict. The per-setter obs_data_set_int calls
+	 * aren't reliably persisted to disk on their own — OBS appears to
+	 * snapshot settings at certain points and the live-dict mutations
+	 * can be lost. Writing them here guarantees they're in the dict
+	 * filter_save passes us and therefore land on disk. */
+	obs_data_set_int(settings, "duration", d->duration_ms);
+	obs_data_set_int(settings, "fade_duration", d->fade_duration_ms);
+	obs_data_set_int(settings, "atem_sync_delay_ms", d->atem_sync_delay_ms);
+	obs_data_set_int(settings, "fade_sync_delay_ms", d->fade_sync_delay_ms);
 
 	/* Strip the legacy flat "presets" key — older versions read from it
 	 * and would clobber the buckets on load. Leaving it stale risks data

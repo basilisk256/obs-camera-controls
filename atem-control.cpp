@@ -83,6 +83,7 @@ public:
 	}
 
 	bool isConnected() const { return connected_.load(); }
+	int  lastProgramInput() const { return last_program_input_.load(); }
 
 private:
 	void push(const AtemRequest &r)
@@ -162,11 +163,13 @@ private:
 				     opName, req.input, (long)hr);
 				disconnect();
 			} else if (req.kind == AtemRequest::MIX) {
+				last_program_input_.store(req.input);
 				blog(LOG_INFO,
 				     "[Shot Presets] ATEM mix transition -> %d "
 				     "(%d frames)",
 				     req.input, req.duration_frames);
 			} else {
+				last_program_input_.store(req.input);
 				blog(LOG_INFO,
 				     "[Shot Presets] ATEM program input -> %d",
 				     req.input);
@@ -259,6 +262,7 @@ private:
 		connected_.store(true);
 		BMDSwitcherInputId current = 0;
 		mixEffectBlock_->GetProgramInput(&current);
+		last_program_input_.store((int)current);
 		blog(LOG_INFO,
 		     "[Shot Presets] ATEM connected (current program input %lld)",
 		     (long long)current);
@@ -284,6 +288,7 @@ private:
 
 	std::atomic<bool> running_{false};
 	std::atomic<bool> connected_{false};
+	std::atomic<int>  last_program_input_{-1};
 	std::thread thread_;
 	std::mutex mutex_;
 	std::condition_variable cv_;
@@ -340,6 +345,15 @@ int atem_is_connected(void)
 	return g_worker.isConnected() ? 1 : 0;
 #else
 	return 0;
+#endif
+}
+
+int atem_get_last_program_input(void)
+{
+#ifdef _WIN32
+	return g_worker.lastProgramInput();
+#else
+	return -1;
 #endif
 }
 
