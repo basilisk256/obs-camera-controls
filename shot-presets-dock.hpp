@@ -25,6 +25,7 @@ private slots:
 	void onCaptureClicked(int index);
 	void onEditToggled(int index);
 	void onDurationChanged(int value);
+	void onFadeDurationChanged(int value);
 	void onAtemSyncDelayChanged(int value);
 	void onPresetDurationChanged(int index, int value);
 	void onTransitionChanged(int index, int type);
@@ -40,6 +41,7 @@ private:
 
 	QVBoxLayout *mainLayout;
 	QSpinBox *durationSpin;
+	QSpinBox *fadeDurationSpin;
 	QSpinBox *atemSyncSpin;
 	QComboBox *easingTypeCb;
 	QComboBox *easingFuncCb;

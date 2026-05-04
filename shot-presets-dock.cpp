@@ -58,6 +58,21 @@ void ShotPresetsDock::buildUI()
 	durRow->addWidget(durationSpin);
 
 	durRow->addSpacing(8);
+	durRow->addWidget(new QLabel("Fade:"));
+	fadeDurationSpin = new QSpinBox();
+	fadeDurationSpin->setRange(50, 2000);
+	fadeDurationSpin->setSuffix(" ms");
+	fadeDurationSpin->setSingleStep(50);
+	fadeDurationSpin->setToolTip(
+		"Default fade duration (per-row Fade button + ATEM hardware "
+		"mix transition rate). Per-preset Duration in Edit panel "
+		"overrides this when set.");
+	fadeDurationSpin->setValue(shot_presets_get_fade_duration());
+	connect(fadeDurationSpin, QOverload<int>::of(&QSpinBox::valueChanged),
+		this, &ShotPresetsDock::onFadeDurationChanged);
+	durRow->addWidget(fadeDurationSpin);
+
+	durRow->addSpacing(8);
 	durRow->addWidget(new QLabel("ATEM sync:"));
 	atemSyncSpin = new QSpinBox();
 	atemSyncSpin->setRange(0, 1000);
@@ -134,6 +149,14 @@ void ShotPresetsDock::refreshUI()
 		if (atemSyncSpin->value() != sync) {
 			QSignalBlocker b(atemSyncSpin);
 			atemSyncSpin->setValue(sync);
+		}
+	}
+
+	if (fadeDurationSpin && !fadeDurationSpin->hasFocus()) {
+		int fdur = shot_presets_get_fade_duration();
+		if (fadeDurationSpin->value() != fdur) {
+			QSignalBlocker b(fadeDurationSpin);
+			fadeDurationSpin->setValue(fdur);
 		}
 	}
 
@@ -528,6 +551,11 @@ void ShotPresetsDock::onDurationChanged(int value)
 void ShotPresetsDock::onAtemSyncDelayChanged(int value)
 {
 	shot_presets_set_atem_sync_delay(value);
+}
+
+void ShotPresetsDock::onFadeDurationChanged(int value)
+{
+	shot_presets_set_fade_duration(value);
 }
 
 /* ── Registration ───────────────────────────────────────────── */

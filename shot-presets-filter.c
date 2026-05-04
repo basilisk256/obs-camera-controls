@@ -110,7 +110,11 @@ struct shot_presets_data {
 	bool sync_dirty;          /* unsaved sceneitem change pending */
 
 	/* Settings */
-	int duration_ms;
+	int duration_ms;        /* default move animation duration */
+	int fade_duration_ms;   /* default fade duration (separate from move
+	                         * because cross-fades typically want longer
+	                         * than camera-moves); also drives the ATEM
+	                         * hardware mix transition rate */
 	int easing_type;
 	int easing_function;
 	int atem_sync_delay_ms;   /* hold sceneitem transform back this many
@@ -435,6 +439,23 @@ void shot_presets_set_duration(int ms)
 	if (ms < 50)
 		ms = 400;
 	g_active_instance->duration_ms = ms;
+}
+
+int shot_presets_get_fade_duration(void)
+{
+	return g_active_instance ? g_active_instance->fade_duration_ms : 600;
+}
+
+void shot_presets_set_fade_duration(int ms)
+{
+	if (!g_active_instance)
+		return;
+	if (ms < 50) ms = 600;
+	if (ms > 5000) ms = 5000;
+	g_active_instance->fade_duration_ms = ms;
+	obs_data_t *settings = obs_source_get_settings(g_active_instance->source);
+	obs_data_set_int(settings, "fade_duration", ms);
+	obs_data_release(settings);
 }
 
 int shot_presets_capture(int preset_index)
@@ -1221,10 +1242,13 @@ static void go_to_preset_internal(struct shot_presets_data *d, int index,
 			? transition_override
 			: bk->presets[index].transition_type;
 		if (atem >= 1 && eff_t == SHOT_TRANSITION_FADE) {
+			/* Fade uses the dedicated fade_duration_ms default
+			 * (separate from move duration) unless this preset has
+			 * an explicit per-preset duration override. */
 			int dur_ms = bk->presets[index].duration_ms > 0
 				? bk->presets[index].duration_ms
-				: d->duration_ms;
-			if (dur_ms < 50) dur_ms = 400;
+				: d->fade_duration_ms;
+			if (dur_ms < 50) dur_ms = 600;
 			/* ATEM mix rate is in ATEM frames; assume 30fps. */
 			int frames = (dur_ms + 16) / 33;
 			if (frames < 1) frames = 1;
@@ -1298,16 +1322,18 @@ static void go_to_preset_internal(struct shot_presets_data *d, int index,
 	 * write path. */
 	d->sync_dirty = false;
 	d->running_duration = 0.0f;
-	d->active_duration_ms = bk->presets[index].duration_ms > 0
-		? bk->presets[index].duration_ms
-		: d->duration_ms;
-	if (d->active_duration_ms < 50)
-		d->active_duration_ms = 400;
-
 	int effective_transition = (transition_override >= 0)
 		? transition_override
 		: bk->presets[index].transition_type;
 	bool is_fade = (effective_transition == SHOT_TRANSITION_FADE);
+	/* Fade uses the dedicated fade default; move uses the move default.
+	 * Per-preset duration_ms overrides either when > 0. */
+	int default_dur = is_fade ? d->fade_duration_ms : d->duration_ms;
+	d->active_duration_ms = bk->presets[index].duration_ms > 0
+		? bk->presets[index].duration_ms
+		: default_dur;
+	if (d->active_duration_ms < 50)
+		d->active_duration_ms = is_fade ? 600 : 400;
 	d->fade_enabled = false;
 	d->fade_t = 0.0f;
 
@@ -1708,6 +1734,9 @@ static void *filter_create(obs_data_t *settings, obs_source_t *source)
 	d->duration_ms = (int)obs_data_get_int(settings, "duration");
 	if (d->duration_ms < 50)
 		d->duration_ms = 400;
+	d->fade_duration_ms = (int)obs_data_get_int(settings, "fade_duration");
+	if (d->fade_duration_ms < 50)
+		d->fade_duration_ms = 600;
 	d->easing_type = (int)obs_data_get_int(settings, "easing_type");
 	d->easing_function = (int)obs_data_get_int(settings, "easing_function");
 	d->atem_sync_delay_ms = (int)obs_data_get_int(settings, "atem_sync_delay_ms");
@@ -2035,6 +2064,7 @@ static obs_properties_t *filter_properties(void *data)
 static void filter_defaults(obs_data_t *settings)
 {
 	obs_data_set_default_int(settings, "duration", 400);
+	obs_data_set_default_int(settings, "fade_duration", 600);
 	obs_data_set_default_int(settings, "easing_type", EASE_IN_OUT);
 	obs_data_set_default_int(settings, "easing_function", EASING_CUBIC);
 }
@@ -2045,6 +2075,9 @@ static void filter_update(void *data, obs_data_t *settings)
 	d->duration_ms = (int)obs_data_get_int(settings, "duration");
 	if (d->duration_ms < 50)
 		d->duration_ms = 400;
+	d->fade_duration_ms = (int)obs_data_get_int(settings, "fade_duration");
+	if (d->fade_duration_ms < 50)
+		d->fade_duration_ms = 600;
 	d->easing_type = (int)obs_data_get_int(settings, "easing_type");
 	d->easing_function = (int)obs_data_get_int(settings, "easing_function");
 	d->atem_sync_delay_ms = (int)obs_data_get_int(settings, "atem_sync_delay_ms");

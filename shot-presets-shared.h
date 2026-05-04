@@ -29,9 +29,17 @@ void shot_presets_set_name(int index, const char *name);
 /* Check if a preset has a saved transform */
 int shot_presets_is_active(int index);
 
-/* Get/set global default duration */
+/* Get/set global default duration (used for Move animations and as a
+ * fallback for any preset whose own duration is 0) */
 int shot_presets_get_duration(void);
 void shot_presets_set_duration(int ms);
+
+/* Get/set the global default Fade duration (used by the per-row Fade
+ * button when the preset's own duration is 0). Separate from the move
+ * default because cross-fades typically need longer. Also drives the
+ * ATEM hardware mix transition rate when ATEM input is wired. */
+int shot_presets_get_fade_duration(void);
+void shot_presets_set_fade_duration(int ms);
 
 /* Per-preset duration override (0 = use global default) */
 int shot_presets_get_preset_duration(int index);
