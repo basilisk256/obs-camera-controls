@@ -1288,29 +1288,24 @@ static void go_to_preset_internal(struct shot_presets_data *d, int index,
 		bool atem_same_input = (atem >= 1) &&
 			(atem_get_last_program_input() == atem);
 		if (atem >= 1 && eff_t == SHOT_TRANSITION_FADE && !atem_same_input) {
-			/* FADE + ATEM input (different from current): the
-			 * ATEM hardware does the camera crossfade. We don't
-			 * use a static "snap at midpoint" delay anymore —
-			 * the BMD MixEffectCallback tells us when the ATEM
-			 * is actually at the visible midpoint, eliminating
-			 * USB-outbound jitter. We snapshot the midpoint
-			 * counter, fire the mix, and wait for the counter
-			 * to increment. filter_tick converts the wait into
-			 * a normal cut scheduled fade_sync_delay_ms after
-			 * the callback fires (semantics: "render delay after
-			 * the ATEM reports midpoint"). */
+			/* FADE + ATEM input (different from current): fire
+			 * the ATEM hardware mix transition (camera crossfade
+			 * in hardware), then defer the OBS-side cross-dissolve
+			 * animation by fade_sync_delay_ms so it starts when
+			 * the ATEM crossfade is visible in OBS (= render delay
+			 * after click). Both fades then run simultaneously
+			 * over fade_duration_ms — the result is a single
+			 * smooth combined transition between the two framings
+			 * of the two cameras. No snap. */
 			int dur_ms = bk->presets[index].duration_ms > 0
 				? bk->presets[index].duration_ms
 				: d->fade_duration_ms;
 			if (dur_ms < 50) dur_ms = 600;
 			int frames = (dur_ms + 16) / 33;
 			if (frames < 1) frames = 1;
-
-			d->pending_midpoint_snapshot =
-				atem_get_mix_midpoint_counter();
 			atem_perform_mix_transition(atem, frames);
 
-			d->pending_kind = PENDING_FADE_AWAIT_MIDPOINT;
+			d->pending_kind = PENDING_GO;
 			d->pending_index = index;
 			d->pending_transition_override = transition_override;
 			d->pending_elapsed = 0.0f;
@@ -1319,11 +1314,9 @@ static void go_to_preset_internal(struct shot_presets_data *d, int index,
 			         "%s", g_active_scene_name);
 			blog(LOG_INFO,
 			     "[Shot Presets] FADE '%s' -> ATEM mix %d "
-			     "(%d frames / %dms); awaiting midpoint callback "
-			     "(snapshot=%llu); will snap +%d ms after, "
-			     "scene='%s'",
+			     "(%d frames / %dms); OBS cross-dissolve deferred "
+			     "by %d ms (fade_sync), scene='%s'",
 			     bk->presets[index].name, atem, frames, dur_ms,
-			     d->pending_midpoint_snapshot,
 			     d->fade_sync_delay_ms, g_active_scene_name);
 			return;
 		}
@@ -2248,37 +2241,11 @@ static void filter_tick(void *data, float seconds)
 {
 	struct shot_presets_data *d = data;
 
-	/* PENDING_FADE_AWAIT_MIDPOINT: poll the BMD MixEffect callback
-	 * counter. When the in-flight mix has crossed 50% (counter has
-	 * incremented past our snapshot), convert into a normal
-	 * PENDING_CUT scheduled fade_sync_delay_ms later. That second leg
-	 * compensates for the OBS render delay between the ATEM hardware
-	 * midpoint and the moment the midpoint frame appears in OBS. */
-	if (d->pending_kind == PENDING_FADE_AWAIT_MIDPOINT) {
-		unsigned long long now =
-			atem_get_mix_midpoint_counter();
-		if (now > d->pending_midpoint_snapshot) {
-			blog(LOG_INFO,
-			     "[Shot Presets] ATEM midpoint detected "
-			     "(counter %llu -> %llu); scheduling framing "
-			     "snap +%d ms",
-			     d->pending_midpoint_snapshot, now,
-			     d->pending_sync_delay_ms);
-			d->pending_kind = PENDING_CUT;
-			d->pending_elapsed = 0.0f;
-			/* pending_index, pending_sync_delay_ms,
-			 * pending_scene already set at trigger time. */
-		}
-		/* fall through to normal pending handling below in case we
-		 * just transitioned to PENDING_CUT */
-	}
-
 	/* ATEM-sync deferred apply. ATEM was already fired at click time;
 	 * after pending_sync_delay_ms elapses we apply the framing change
 	 * so it lands together with the new ATEM video frame in OBS. The
 	 * delay value was snapshotted at defer time (cut vs fade differ). */
-	if (d->pending_kind != PENDING_NONE &&
-	    d->pending_kind != PENDING_FADE_AWAIT_MIDPOINT) {
+	if (d->pending_kind != PENDING_NONE) {
 		d->pending_elapsed += seconds;
 		float threshold = (float)d->pending_sync_delay_ms / 1000.0f;
 		if (d->pending_elapsed >= threshold) {
