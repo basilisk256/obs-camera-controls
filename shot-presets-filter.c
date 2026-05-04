@@ -1270,24 +1270,43 @@ static void go_to_preset_internal(struct shot_presets_data *d, int index,
 			? transition_override
 			: bk->presets[index].transition_type;
 		if (atem >= 1 && eff_t == SHOT_TRANSITION_FADE) {
-			/* Fade uses the dedicated fade_duration_ms default
-			 * (separate from move duration) unless this preset has
-			 * an explicit per-preset duration override. */
+			/* FADE + ATEM input: use the ATEM hardware mix
+			 * transition for the camera crossfade. The OBS
+			 * framing change is a CUT (not an animation, not a
+			 * cross-dissolve), scheduled to land at the midpoint
+			 * of the ATEM crossfade in OBS so the framing snap
+			 * is hidden in the busiest visible moment of the
+			 * camera fade. No intermediate framings visible. */
 			int dur_ms = bk->presets[index].duration_ms > 0
 				? bk->presets[index].duration_ms
 				: d->fade_duration_ms;
 			if (dur_ms < 50) dur_ms = 600;
-			/* ATEM mix rate is in ATEM frames; assume 30fps. */
 			int frames = (dur_ms + 16) / 33;
 			if (frames < 1) frames = 1;
 			atem_perform_mix_transition(atem, frames);
+
+			/* Snap timing: fade_sync_delay (when ATEM crossfade
+			 * START is visible in OBS) + half the duration =
+			 * midpoint of the visible crossfade. */
+			int snap_delay = d->fade_sync_delay_ms + dur_ms / 2;
+			d->pending_kind = PENDING_CUT;
+			d->pending_index = index;
+			d->pending_transition_override = transition_override;
+			d->pending_elapsed = 0.0f;
+			d->pending_sync_delay_ms = snap_delay;
+			snprintf(d->pending_scene, sizeof(d->pending_scene),
+			         "%s", g_active_scene_name);
 			blog(LOG_INFO,
-			     "[Shot Presets] ATEM mix transition queued: "
-			     "input=%d frames=%d (dur=%dms)",
-			     atem, frames, dur_ms);
-		} else {
-			fire_atem_program(atem);
+			     "[Shot Presets] FADE '%s' -> ATEM mix %d "
+			     "(%d frames / %dms); framing snap at midpoint "
+			     "(+%d ms = fade_sync %d + dur/2 %d), scene='%s'",
+			     bk->presets[index].name, atem, frames, dur_ms,
+			     snap_delay, d->fade_sync_delay_ms, dur_ms / 2,
+			     g_active_scene_name);
+			return;
 		}
+
+		fire_atem_program(atem);
 		/* Pick the appropriate sync delay for the transition kind:
 		 * fades use fade_sync_delay_ms (typically lower because the
 		 * framing fade should *start* when the ATEM crossfade start
