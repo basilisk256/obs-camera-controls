@@ -1408,7 +1408,15 @@ static void go_to_preset_internal(struct shot_presets_data *d, int index,
 	int effective_transition = (transition_override >= 0)
 		? transition_override
 		: bk->presets[index].transition_type;
-	bool is_fade = (effective_transition == SHOT_TRANSITION_FADE);
+	/* Use the OBS-side cross-dissolve effect ONLY for same-source fades
+	 * (no ATEM input set on this preset). When ATEM is set, the camera
+	 * change is handled by ATEM hardware mix; running the OBS cross-
+	 * dissolve simultaneously produces the visible "ghost overlap" of
+	 * two framing rectangles which the user sees as a third intermediate
+	 * state. Falling through to the MOVE animation path instead gives
+	 * a single-rectangle smooth zoom alongside the camera fade. */
+	bool is_fade = (effective_transition == SHOT_TRANSITION_FADE) &&
+	               (bk->presets[index].atem_input == 0);
 	/* Fade uses the dedicated fade default; move uses the move default.
 	 * Per-preset duration_ms overrides either when > 0. */
 	int default_dur = is_fade ? d->fade_duration_ms : d->duration_ms;
