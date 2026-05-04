@@ -43,11 +43,11 @@ void ShotPresetsDock::buildUI()
 	mainLayout->setContentsMargins(6, 6, 6, 6);
 	mainLayout->setSpacing(4);
 
-	/* Duration + ATEM-sync delay controls share one row to keep the
-	 * dock compact. ATEM sync delays the framing change after firing
-	 * the ATEM switch so both land on the same video frame in OBS. */
-	QHBoxLayout *durRow = new QHBoxLayout();
-	durRow->addWidget(new QLabel("Duration:"));
+	/* Duration + sync controls split across two rows to keep the dock
+	 * narrow. Row 1 = Move/Cut: Duration + ATEM sync. Row 2 = Fade:
+	 * Fade duration + Fade sync. */
+	QHBoxLayout *moveRow = new QHBoxLayout();
+	moveRow->addWidget(new QLabel("Move:"));
 	durationSpin = new QSpinBox();
 	durationSpin->setRange(50, 5000);
 	durationSpin->setSuffix(" ms");
@@ -55,10 +55,29 @@ void ShotPresetsDock::buildUI()
 	durationSpin->setValue(shot_presets_get_duration());
 	connect(durationSpin, QOverload<int>::of(&QSpinBox::valueChanged),
 		this, &ShotPresetsDock::onDurationChanged);
-	durRow->addWidget(durationSpin);
+	moveRow->addWidget(durationSpin);
 
-	durRow->addSpacing(8);
-	durRow->addWidget(new QLabel("Fade:"));
+	moveRow->addSpacing(8);
+	moveRow->addWidget(new QLabel("ATEM sync:"));
+	atemSyncSpin = new QSpinBox();
+	atemSyncSpin->setRange(0, 1000);
+	atemSyncSpin->setSuffix(" ms");
+	atemSyncSpin->setSingleStep(10);
+	atemSyncSpin->setSpecialValueText("(off)");
+	atemSyncSpin->setToolTip(
+		"Delay the framing change by this many ms after firing the "
+		"ATEM input switch so both land together in OBS. Tune to "
+		"USB capture latency + Render Delay filter time. 0 = off. "
+		"Applies to Move/Cut transitions.");
+	atemSyncSpin->setValue(shot_presets_get_atem_sync_delay());
+	connect(atemSyncSpin, QOverload<int>::of(&QSpinBox::valueChanged),
+		this, &ShotPresetsDock::onAtemSyncDelayChanged);
+	moveRow->addWidget(atemSyncSpin);
+	moveRow->addStretch();
+	mainLayout->addLayout(moveRow);
+
+	QHBoxLayout *fadeRow = new QHBoxLayout();
+	fadeRow->addWidget(new QLabel("Fade:"));
 	fadeDurationSpin = new QSpinBox();
 	fadeDurationSpin->setRange(50, 2000);
 	fadeDurationSpin->setSuffix(" ms");
@@ -70,41 +89,26 @@ void ShotPresetsDock::buildUI()
 	fadeDurationSpin->setValue(shot_presets_get_fade_duration());
 	connect(fadeDurationSpin, QOverload<int>::of(&QSpinBox::valueChanged),
 		this, &ShotPresetsDock::onFadeDurationChanged);
-	durRow->addWidget(fadeDurationSpin);
+	fadeRow->addWidget(fadeDurationSpin);
 
-	durRow->addSpacing(8);
-	durRow->addWidget(new QLabel("ATEM sync:"));
-	atemSyncSpin = new QSpinBox();
-	atemSyncSpin->setRange(0, 1000);
-	atemSyncSpin->setSuffix(" ms");
-	atemSyncSpin->setSingleStep(10);
-	atemSyncSpin->setSpecialValueText("(off)");
-	atemSyncSpin->setToolTip(
-		"Delay the framing change by this many ms after firing the "
-		"ATEM input switch so both land together in OBS. Tune to "
-		"USB capture latency + Render Delay filter time. 0 = off.");
-	atemSyncSpin->setValue(shot_presets_get_atem_sync_delay());
-	connect(atemSyncSpin, QOverload<int>::of(&QSpinBox::valueChanged),
-		this, &ShotPresetsDock::onAtemSyncDelayChanged);
-	durRow->addWidget(atemSyncSpin);
-
-	durRow->addSpacing(8);
-	durRow->addWidget(new QLabel("Fade sync:"));
+	fadeRow->addSpacing(8);
+	fadeRow->addWidget(new QLabel("Fade sync:"));
 	fadeSyncSpin = new QSpinBox();
 	fadeSyncSpin->setRange(0, 1000);
 	fadeSyncSpin->setSuffix(" ms");
 	fadeSyncSpin->setSingleStep(10);
 	fadeSyncSpin->setSpecialValueText("(off)");
 	fadeSyncSpin->setToolTip(
-		"Same as ATEM sync but applied to FADE-mode triggers only. "
-		"For fades, the framing crossfade should *start* when the "
-		"ATEM crossfade *start* is visible in OBS — typically lower "
-		"than the cut sync value.");
+		"Same as ATEM sync but for FADE-mode triggers. For fades the "
+		"framing crossfade should *start* when the ATEM crossfade "
+		"*start* is visible in OBS — typically lower than the cut "
+		"sync value.");
 	fadeSyncSpin->setValue(shot_presets_get_fade_sync_delay());
 	connect(fadeSyncSpin, QOverload<int>::of(&QSpinBox::valueChanged),
 		this, &ShotPresetsDock::onFadeSyncDelayChanged);
-	durRow->addWidget(fadeSyncSpin);
-	mainLayout->addLayout(durRow);
+	fadeRow->addWidget(fadeSyncSpin);
+	fadeRow->addStretch();
+	mainLayout->addLayout(fadeRow);
 
 	/* Empty-state label shown when no Shot Presets filter exists on
 	 * any source in the current scene. */
