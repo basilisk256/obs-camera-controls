@@ -120,7 +120,16 @@ struct shot_presets_data {
 	int atem_sync_delay_ms;   /* hold sceneitem transform back this many
 	                           * ms after firing ATEM, so the OBS framing
 	                           * change lands together with the new ATEM
-	                           * video frame. Filter-global. 0 = disabled. */
+	                           * video frame. For Move/Cut only.
+	                           * Filter-global. 0 = disabled. */
+	int fade_sync_delay_ms;   /* same idea as atem_sync_delay_ms but
+	                           * specifically for FADE-mode triggers.
+	                           * Tuning differs because cuts are instant
+	                           * and fades span time, so the framing fade
+	                           * needs to start when the ATEM crossfade
+	                           * START is visible in OBS — typically
+	                           * render_delay + USB latency, lower than
+	                           * the cut value. */
 
 	/* Pending delayed apply for ATEM sync. When pending_kind != PENDING_NONE,
 	 * filter_tick increments pending_elapsed each frame; when it hits
@@ -135,6 +144,8 @@ struct shot_presets_data {
 	} pending_kind;
 	int   pending_index;
 	int   pending_transition_override; /* -1 = use preset's setting */
+	int   pending_sync_delay_ms;       /* snapshot of which sync delay
+	                                    * applies (cut vs fade) */
 	float pending_elapsed; /* seconds */
 	char  pending_scene[SCENE_NAME_LEN];
 
@@ -651,6 +662,23 @@ void shot_presets_set_atem_sync_delay(int ms)
 	g_active_instance->atem_sync_delay_ms = ms;
 	obs_data_t *settings = obs_source_get_settings(g_active_instance->source);
 	obs_data_set_int(settings, "atem_sync_delay_ms", ms);
+	obs_data_release(settings);
+}
+
+int shot_presets_get_fade_sync_delay(void)
+{
+	return g_active_instance ? g_active_instance->fade_sync_delay_ms : 550;
+}
+
+void shot_presets_set_fade_sync_delay(int ms)
+{
+	if (!g_active_instance)
+		return;
+	if (ms < 0) ms = 0;
+	if (ms > 1000) ms = 1000;
+	g_active_instance->fade_sync_delay_ms = ms;
+	obs_data_t *settings = obs_source_get_settings(g_active_instance->source);
+	obs_data_set_int(settings, "fade_sync_delay_ms", ms);
 	obs_data_release(settings);
 }
 
@@ -1260,17 +1288,26 @@ static void go_to_preset_internal(struct shot_presets_data *d, int index,
 		} else {
 			fire_atem_program(atem);
 		}
-		if (atem >= 1 && d->atem_sync_delay_ms > 0) {
+		/* Pick the appropriate sync delay for the transition kind:
+		 * fades use fade_sync_delay_ms (typically lower because the
+		 * framing fade should *start* when the ATEM crossfade start
+		 * is visible), cuts/moves use atem_sync_delay_ms. */
+		int eff_sync_delay = (eff_t == SHOT_TRANSITION_FADE)
+			? d->fade_sync_delay_ms
+			: d->atem_sync_delay_ms;
+		if (atem >= 1 && eff_sync_delay > 0) {
 			d->pending_kind = PENDING_GO;
 			d->pending_index = index;
 			d->pending_transition_override = transition_override;
 			d->pending_elapsed = 0.0f;
+			d->pending_sync_delay_ms = eff_sync_delay;
 			snprintf(d->pending_scene, sizeof(d->pending_scene),
 			         "%s", g_active_scene_name);
 			blog(LOG_INFO,
-			     "[Shot Presets] GO '%s' deferred by %d ms (ATEM "
-			     "sync, scene='%s')",
-			     bk->presets[index].name, d->atem_sync_delay_ms,
+			     "[Shot Presets] GO '%s' deferred by %d ms (%s sync, "
+			     "scene='%s')",
+			     bk->presets[index].name, eff_sync_delay,
+			     eff_t == SHOT_TRANSITION_FADE ? "FADE" : "ATEM",
 			     d->pending_scene);
 			return;
 		}
@@ -1514,12 +1551,13 @@ void cut_to_preset(struct shot_presets_data *d, int index)
 	if (atem >= 1 && d->atem_sync_delay_ms > 0) {
 		/* Defer the framing change so it lands together with the
 		 * new ATEM video frame in OBS. filter_tick will apply it
-		 * when pending_elapsed reaches atem_sync_delay_ms.
+		 * when pending_elapsed reaches pending_sync_delay_ms.
 		 * Snapshot the active scene name so we don't mis-apply if
 		 * the user switches scenes inside the delay window. */
 		d->pending_kind = PENDING_CUT;
 		d->pending_index = index;
 		d->pending_elapsed = 0.0f;
+		d->pending_sync_delay_ms = d->atem_sync_delay_ms;
 		snprintf(d->pending_scene, sizeof(d->pending_scene), "%s",
 		         g_active_scene_name);
 		blog(LOG_INFO,
@@ -1742,6 +1780,9 @@ static void *filter_create(obs_data_t *settings, obs_source_t *source)
 	d->atem_sync_delay_ms = (int)obs_data_get_int(settings, "atem_sync_delay_ms");
 	if (d->atem_sync_delay_ms < 0) d->atem_sync_delay_ms = 0;
 	if (d->atem_sync_delay_ms > 1000) d->atem_sync_delay_ms = 1000;
+	d->fade_sync_delay_ms = (int)obs_data_get_int(settings, "fade_sync_delay_ms");
+	if (d->fade_sync_delay_ms < 0) d->fade_sync_delay_ms = 0;
+	if (d->fade_sync_delay_ms > 1000) d->fade_sync_delay_ms = 1000;
 	d->pending_kind = PENDING_NONE;
 
 	/* Enabled-scenes list. Prefer the explicit array if present;
@@ -2065,6 +2106,7 @@ static void filter_defaults(obs_data_t *settings)
 {
 	obs_data_set_default_int(settings, "duration", 400);
 	obs_data_set_default_int(settings, "fade_duration", 600);
+	obs_data_set_default_int(settings, "fade_sync_delay_ms", 550);
 	obs_data_set_default_int(settings, "easing_type", EASE_IN_OUT);
 	obs_data_set_default_int(settings, "easing_function", EASING_CUBIC);
 }
@@ -2083,6 +2125,9 @@ static void filter_update(void *data, obs_data_t *settings)
 	d->atem_sync_delay_ms = (int)obs_data_get_int(settings, "atem_sync_delay_ms");
 	if (d->atem_sync_delay_ms < 0) d->atem_sync_delay_ms = 0;
 	if (d->atem_sync_delay_ms > 1000) d->atem_sync_delay_ms = 1000;
+	d->fade_sync_delay_ms = (int)obs_data_get_int(settings, "fade_sync_delay_ms");
+	if (d->fade_sync_delay_ms < 0) d->fade_sync_delay_ms = 0;
+	if (d->fade_sync_delay_ms > 1000) d->fade_sync_delay_ms = 1000;
 
 	/* Rebuild the enabled-scenes list from per-scene checkbox state.
 	 * Every scene currently known to the frontend gets a `scene_enabled_<name>`
@@ -2140,11 +2185,12 @@ static void filter_tick(void *data, float seconds)
 	struct shot_presets_data *d = data;
 
 	/* ATEM-sync deferred apply. ATEM was already fired at click time;
-	 * after atem_sync_delay_ms elapses we apply the framing change so
-	 * it lands together with the new ATEM video frame in OBS. */
+	 * after pending_sync_delay_ms elapses we apply the framing change
+	 * so it lands together with the new ATEM video frame in OBS. The
+	 * delay value was snapshotted at defer time (cut vs fade differ). */
 	if (d->pending_kind != PENDING_NONE) {
 		d->pending_elapsed += seconds;
-		float threshold = (float)d->atem_sync_delay_ms / 1000.0f;
+		float threshold = (float)d->pending_sync_delay_ms / 1000.0f;
 		if (d->pending_elapsed >= threshold) {
 			int kind = d->pending_kind;
 			int idx = d->pending_index;
@@ -2168,9 +2214,9 @@ static void filter_tick(void *data, float seconds)
 				    bk->presets[idx].active) {
 					blog(LOG_INFO,
 					     "[Shot Presets] CUT '%s' applied "
-					     "(after %d ms ATEM sync, scene='%s')",
+					     "(after %d ms sync, scene='%s')",
 					     bk->presets[idx].name,
-					     d->atem_sync_delay_ms,
+					     d->pending_sync_delay_ms,
 					     bk->scene_name);
 					apply_cut_inner(d, bk, idx);
 				}

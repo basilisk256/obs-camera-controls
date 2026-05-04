@@ -87,6 +87,23 @@ void ShotPresetsDock::buildUI()
 	connect(atemSyncSpin, QOverload<int>::of(&QSpinBox::valueChanged),
 		this, &ShotPresetsDock::onAtemSyncDelayChanged);
 	durRow->addWidget(atemSyncSpin);
+
+	durRow->addSpacing(8);
+	durRow->addWidget(new QLabel("Fade sync:"));
+	fadeSyncSpin = new QSpinBox();
+	fadeSyncSpin->setRange(0, 1000);
+	fadeSyncSpin->setSuffix(" ms");
+	fadeSyncSpin->setSingleStep(10);
+	fadeSyncSpin->setSpecialValueText("(off)");
+	fadeSyncSpin->setToolTip(
+		"Same as ATEM sync but applied to FADE-mode triggers only. "
+		"For fades, the framing crossfade should *start* when the "
+		"ATEM crossfade *start* is visible in OBS — typically lower "
+		"than the cut sync value.");
+	fadeSyncSpin->setValue(shot_presets_get_fade_sync_delay());
+	connect(fadeSyncSpin, QOverload<int>::of(&QSpinBox::valueChanged),
+		this, &ShotPresetsDock::onFadeSyncDelayChanged);
+	durRow->addWidget(fadeSyncSpin);
 	mainLayout->addLayout(durRow);
 
 	/* Empty-state label shown when no Shot Presets filter exists on
@@ -157,6 +174,14 @@ void ShotPresetsDock::refreshUI()
 		if (fadeDurationSpin->value() != fdur) {
 			QSignalBlocker b(fadeDurationSpin);
 			fadeDurationSpin->setValue(fdur);
+		}
+	}
+
+	if (fadeSyncSpin && !fadeSyncSpin->hasFocus()) {
+		int fsync = shot_presets_get_fade_sync_delay();
+		if (fadeSyncSpin->value() != fsync) {
+			QSignalBlocker b(fadeSyncSpin);
+			fadeSyncSpin->setValue(fsync);
 		}
 	}
 
@@ -556,6 +581,11 @@ void ShotPresetsDock::onAtemSyncDelayChanged(int value)
 void ShotPresetsDock::onFadeDurationChanged(int value)
 {
 	shot_presets_set_fade_duration(value);
+}
+
+void ShotPresetsDock::onFadeSyncDelayChanged(int value)
+{
+	shot_presets_set_fade_sync_delay(value);
 }
 
 /* ── Registration ───────────────────────────────────────────── */

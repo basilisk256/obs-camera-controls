@@ -93,6 +93,13 @@ int shot_presets_get_current_preset(void);
 int  shot_presets_get_atem_sync_delay(void);
 void shot_presets_set_atem_sync_delay(int ms);
 
+/* Same idea but specific to Fade-mode triggers. Cuts are instant and
+ * fades span time, so the framing fade needs to start when the ATEM
+ * crossfade *start* is visible in OBS (≈ render delay + USB latency),
+ * typically a smaller number than the cut sync. */
+int  shot_presets_get_fade_sync_delay(void);
+void shot_presets_set_fade_sync_delay(int ms);
+
 /* Per-scene default preset. The filter snaps to this preset when the scene
  * activates, instead of the last-clicked one. -1 = no default set (falls
  * back to current_preset, then preset 0). Setting clears any previous

@@ -27,6 +27,7 @@ private slots:
 	void onDurationChanged(int value);
 	void onFadeDurationChanged(int value);
 	void onAtemSyncDelayChanged(int value);
+	void onFadeSyncDelayChanged(int value);
 	void onPresetDurationChanged(int index, int value);
 	void onTransitionChanged(int index, int type);
 	void onNameChanged(int index, const QString &name);
@@ -43,6 +44,7 @@ private:
 	QSpinBox *durationSpin;
 	QSpinBox *fadeDurationSpin;
 	QSpinBox *atemSyncSpin;
+	QSpinBox *fadeSyncSpin;
 	QComboBox *easingTypeCb;
 	QComboBox *easingFuncCb;
 	QWidget *presetsContainer;
