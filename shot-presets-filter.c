@@ -141,6 +141,7 @@ struct shot_presets_data {
 		PENDING_NONE = 0,
 		PENDING_CUT,
 		PENDING_GO,
+		PENDING_FADE_AWAIT_MIDPOINT,
 	} pending_kind;
 	int   pending_index;
 	int   pending_transition_override; /* -1 = use preset's setting */
@@ -148,6 +149,13 @@ struct shot_presets_data {
 	                                    * applies (cut vs fade) */
 	float pending_elapsed; /* seconds */
 	char  pending_scene[SCENE_NAME_LEN];
+
+	/* For PENDING_FADE_AWAIT_MIDPOINT: snapshot of the BMD MixEffect
+	 * midpoint counter at trigger time. When atem_get_mix_midpoint_counter()
+	 * exceeds this, the in-flight ATEM mix has crossed 50% — convert
+	 * the pending into a normal PENDING_CUT scheduled fade_sync_delay_ms
+	 * later (which now means "render delay after midpoint"). */
+	unsigned long long pending_midpoint_snapshot;
 
 	/* Hotkeys: registered MAX_PRESETS times at create. Callback resolves
 	 * to the active bucket and invokes the preset at that slot, so a
@@ -1280,40 +1288,43 @@ static void go_to_preset_internal(struct shot_presets_data *d, int index,
 		bool atem_same_input = (atem >= 1) &&
 			(atem_get_last_program_input() == atem);
 		if (atem >= 1 && eff_t == SHOT_TRANSITION_FADE && !atem_same_input) {
-			/* FADE + ATEM input (different from current): use the
-			 * ATEM hardware mix transition for the camera
-			 * crossfade. The OBS framing change is a CUT (not an
-			 * animation, not a cross-dissolve), scheduled to land
-			 * at the midpoint of the ATEM crossfade in OBS so the
-			 * framing snap is hidden in the busiest visible
-			 * moment of the camera fade. No intermediate framings
-			 * visible. */
+			/* FADE + ATEM input (different from current): the
+			 * ATEM hardware does the camera crossfade. We don't
+			 * use a static "snap at midpoint" delay anymore —
+			 * the BMD MixEffectCallback tells us when the ATEM
+			 * is actually at the visible midpoint, eliminating
+			 * USB-outbound jitter. We snapshot the midpoint
+			 * counter, fire the mix, and wait for the counter
+			 * to increment. filter_tick converts the wait into
+			 * a normal cut scheduled fade_sync_delay_ms after
+			 * the callback fires (semantics: "render delay after
+			 * the ATEM reports midpoint"). */
 			int dur_ms = bk->presets[index].duration_ms > 0
 				? bk->presets[index].duration_ms
 				: d->fade_duration_ms;
 			if (dur_ms < 50) dur_ms = 600;
 			int frames = (dur_ms + 16) / 33;
 			if (frames < 1) frames = 1;
+
+			d->pending_midpoint_snapshot =
+				atem_get_mix_midpoint_counter();
 			atem_perform_mix_transition(atem, frames);
 
-			/* Snap timing: fade_sync_delay (when ATEM crossfade
-			 * START is visible in OBS) + half the duration =
-			 * midpoint of the visible crossfade. */
-			int snap_delay = d->fade_sync_delay_ms + dur_ms / 2;
-			d->pending_kind = PENDING_CUT;
+			d->pending_kind = PENDING_FADE_AWAIT_MIDPOINT;
 			d->pending_index = index;
 			d->pending_transition_override = transition_override;
 			d->pending_elapsed = 0.0f;
-			d->pending_sync_delay_ms = snap_delay;
+			d->pending_sync_delay_ms = d->fade_sync_delay_ms;
 			snprintf(d->pending_scene, sizeof(d->pending_scene),
 			         "%s", g_active_scene_name);
 			blog(LOG_INFO,
 			     "[Shot Presets] FADE '%s' -> ATEM mix %d "
-			     "(%d frames / %dms); framing snap at midpoint "
-			     "(+%d ms = fade_sync %d + dur/2 %d), scene='%s'",
+			     "(%d frames / %dms); awaiting midpoint callback "
+			     "(snapshot=%llu); will snap +%d ms after, "
+			     "scene='%s'",
 			     bk->presets[index].name, atem, frames, dur_ms,
-			     snap_delay, d->fade_sync_delay_ms, dur_ms / 2,
-			     g_active_scene_name);
+			     d->pending_midpoint_snapshot,
+			     d->fade_sync_delay_ms, g_active_scene_name);
 			return;
 		}
 
@@ -2237,11 +2248,37 @@ static void filter_tick(void *data, float seconds)
 {
 	struct shot_presets_data *d = data;
 
+	/* PENDING_FADE_AWAIT_MIDPOINT: poll the BMD MixEffect callback
+	 * counter. When the in-flight mix has crossed 50% (counter has
+	 * incremented past our snapshot), convert into a normal
+	 * PENDING_CUT scheduled fade_sync_delay_ms later. That second leg
+	 * compensates for the OBS render delay between the ATEM hardware
+	 * midpoint and the moment the midpoint frame appears in OBS. */
+	if (d->pending_kind == PENDING_FADE_AWAIT_MIDPOINT) {
+		unsigned long long now =
+			atem_get_mix_midpoint_counter();
+		if (now > d->pending_midpoint_snapshot) {
+			blog(LOG_INFO,
+			     "[Shot Presets] ATEM midpoint detected "
+			     "(counter %llu -> %llu); scheduling framing "
+			     "snap +%d ms",
+			     d->pending_midpoint_snapshot, now,
+			     d->pending_sync_delay_ms);
+			d->pending_kind = PENDING_CUT;
+			d->pending_elapsed = 0.0f;
+			/* pending_index, pending_sync_delay_ms,
+			 * pending_scene already set at trigger time. */
+		}
+		/* fall through to normal pending handling below in case we
+		 * just transitioned to PENDING_CUT */
+	}
+
 	/* ATEM-sync deferred apply. ATEM was already fired at click time;
 	 * after pending_sync_delay_ms elapses we apply the framing change
 	 * so it lands together with the new ATEM video frame in OBS. The
 	 * delay value was snapshotted at defer time (cut vs fade differ). */
-	if (d->pending_kind != PENDING_NONE) {
+	if (d->pending_kind != PENDING_NONE &&
+	    d->pending_kind != PENDING_FADE_AWAIT_MIDPOINT) {
 		d->pending_elapsed += seconds;
 		float threshold = (float)d->pending_sync_delay_ms / 1000.0f;
 		if (d->pending_elapsed >= threshold) {

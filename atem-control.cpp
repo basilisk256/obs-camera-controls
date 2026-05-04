@@ -32,6 +32,78 @@
 namespace {
 
 #ifdef _WIN32
+
+/* ── BMD MixEffect callback ─────────────────────────────────────
+ * BMD calls our Notify() from inside its own thread when state
+ * changes on the mix-effect block. We only care about transition
+ * position changes — when the position crosses 0.5 during an in-
+ * flight mix transition, that's the visible midpoint of a fade. We
+ * bump an atomic counter the OBS-side filter_tick polls so it can
+ * react without static-delay guessing. */
+static std::atomic<uint64_t> g_mix_midpoint_counter{0};
+
+class MixEffectCallback : public IBMDSwitcherMixEffectBlockCallback {
+public:
+	explicit MixEffectCallback(IBMDSwitcherMixEffectBlock *me)
+		: refCount_(1), me_(me) {}
+
+	HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, LPVOID *ppv) override
+	{
+		if (!ppv) return E_POINTER;
+		if (memcmp(&iid, &IID_IUnknown, sizeof(IID)) == 0 ||
+		    memcmp(&iid, &IID_IBMDSwitcherMixEffectBlockCallback,
+		           sizeof(IID)) == 0) {
+			*ppv = static_cast<IBMDSwitcherMixEffectBlockCallback *>(this);
+			AddRef();
+			return S_OK;
+		}
+		*ppv = nullptr;
+		return E_NOINTERFACE;
+	}
+
+	ULONG STDMETHODCALLTYPE AddRef(void) override { return ++refCount_; }
+	ULONG STDMETHODCALLTYPE Release(void) override
+	{
+		const ULONG n = --refCount_;
+		if (n == 0) delete this;
+		return n;
+	}
+
+	HRESULT STDMETHODCALLTYPE Notify(
+		BMDSwitcherMixEffectBlockEventType eventType) override
+	{
+		if (eventType ==
+		    bmdSwitcherMixEffectBlockEventTypeTransitionPositionChanged) {
+			double pos = 0.0;
+			if (me_ &&
+			    SUCCEEDED(me_->GetTransitionPosition(&pos))) {
+				/* Fire on every callback that's at or past 0.5
+				 * AFTER a previous report below 0.5 — but the
+				 * callback fires often enough that simpler
+				 * "armed" tracking via atomic is enough.
+				 * One mix transition produces many position-
+				 * change events; we only want one midpoint
+				 * fire per transition. last_pos_ tracks
+				 * previous to detect the rising 0.5 crossing. */
+				double prev = last_pos_.exchange(pos);
+				if (prev < 0.5 && pos >= 0.5) {
+					g_mix_midpoint_counter.fetch_add(1);
+				}
+				/* Reset on transition end so a new one can fire
+				 * its own midpoint. */
+				if (pos >= 1.0 - 1e-6 || pos <= 1e-6)
+					last_pos_.store(0.0);
+			}
+		}
+		return S_OK;
+	}
+
+private:
+	std::atomic<ULONG> refCount_;
+	IBMDSwitcherMixEffectBlock *me_;
+	std::atomic<double> last_pos_{0.0};
+};
+
 struct AtemRequest {
 	enum Kind { CUT, MIX } kind;
 	int input;
@@ -259,12 +331,16 @@ private:
 			return false;
 		}
 
+		callback_ = new MixEffectCallback(mixEffectBlock_);
+		mixEffectBlock_->AddCallback(callback_);
+
 		connected_.store(true);
 		BMDSwitcherInputId current = 0;
 		mixEffectBlock_->GetProgramInput(&current);
 		last_program_input_.store((int)current);
 		blog(LOG_INFO,
-		     "[Shot Presets] ATEM connected (current program input %lld)",
+		     "[Shot Presets] ATEM connected (current program input %lld) "
+		     "+ MixEffect callback registered",
 		     (long long)current);
 		return true;
 	}
@@ -272,6 +348,13 @@ private:
 	void disconnect()
 	{
 		connected_.store(false);
+		if (mixEffectBlock_ && callback_) {
+			mixEffectBlock_->RemoveCallback(callback_);
+		}
+		if (callback_) {
+			callback_->Release();
+			callback_ = nullptr;
+		}
 		if (mixEffectBlock_) {
 			mixEffectBlock_->Release();
 			mixEffectBlock_ = nullptr;
@@ -297,6 +380,7 @@ private:
 	IBMDSwitcherDiscovery *discovery_ = nullptr;
 	IBMDSwitcher *switcher_ = nullptr;
 	IBMDSwitcherMixEffectBlock *mixEffectBlock_ = nullptr;
+	MixEffectCallback *callback_ = nullptr;
 };
 
 static AtemWorker g_worker;
@@ -354,6 +438,15 @@ int atem_get_last_program_input(void)
 	return g_worker.lastProgramInput();
 #else
 	return -1;
+#endif
+}
+
+unsigned long long atem_get_mix_midpoint_counter(void)
+{
+#ifdef _WIN32
+	return (unsigned long long)g_mix_midpoint_counter.load();
+#else
+	return 0ULL;
 #endif
 }
 

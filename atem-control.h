@@ -48,6 +48,15 @@ int atem_is_connected(void);
  * instead. */
 int atem_get_last_program_input(void);
 
+/* Counter incremented by the BMD MixEffectCallback each time an in-
+ * flight mix transition crosses the 50% midpoint. The plugin filter
+ * snapshots this value at fade-trigger time and watches it in
+ * filter_tick — when the value increments, the ATEM (and hence the
+ * camera fade visible in OBS after render delay) is at its midpoint.
+ * Used by the FADE path to schedule the framing snap relative to the
+ * ATEM's actual midpoint instead of guessing with a static delay. */
+unsigned long long atem_get_mix_midpoint_counter(void);
+
 #ifdef __cplusplus
 }
 #endif
