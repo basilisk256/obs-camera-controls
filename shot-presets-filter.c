@@ -147,6 +147,12 @@ struct shot_presets_data {
 	int   pending_transition_override; /* -1 = use preset's setting */
 	int   pending_sync_delay_ms;       /* snapshot of which sync delay
 	                                    * applies (cut vs fade) */
+	int   pending_move_duration_ms;    /* if > 0, override the MOVE
+	                                    * animation duration on re-entry
+	                                    * (used by FADE+ATEM to make the
+	                                    * framing transition imperceptibly
+	                                    * fast — hidden inside the camera
+	                                    * fade midpoint) */
 	float pending_elapsed; /* seconds */
 	char  pending_scene[SCENE_NAME_LEN];
 
@@ -1288,15 +1294,14 @@ static void go_to_preset_internal(struct shot_presets_data *d, int index,
 		bool atem_same_input = (atem >= 1) &&
 			(atem_get_last_program_input() == atem);
 		if (atem >= 1 && eff_t == SHOT_TRANSITION_FADE && !atem_same_input) {
-			/* FADE + ATEM input (different from current): fire
-			 * the ATEM hardware mix transition (camera crossfade
-			 * in hardware), then defer the OBS-side cross-dissolve
-			 * animation by fade_sync_delay_ms so it starts when
-			 * the ATEM crossfade is visible in OBS (= render delay
-			 * after click). Both fades then run simultaneously
-			 * over fade_duration_ms — the result is a single
-			 * smooth combined transition between the two framings
-			 * of the two cameras. No snap. */
+			/* FADE + ATEM input (different from current): the
+			 * ATEM hardware crossfade handles the camera change
+			 * smoothly. The OBS framing change is a near-instant
+			 * MOVE animation (~1 frame) timed to land at the
+			 * midpoint of the visible ATEM crossfade — when both
+			 * cameras are 50/50, the framing change is masked by
+			 * the busiest moment of the camera fade and is
+			 * effectively invisible. */
 			int dur_ms = bk->presets[index].duration_ms > 0
 				? bk->presets[index].duration_ms
 				: d->fade_duration_ms;
@@ -1309,15 +1314,25 @@ static void go_to_preset_internal(struct shot_presets_data *d, int index,
 			d->pending_index = index;
 			d->pending_transition_override = transition_override;
 			d->pending_elapsed = 0.0f;
-			d->pending_sync_delay_ms = d->fade_sync_delay_ms;
+			/* Defer until the visible midpoint of the ATEM
+			 * crossfade in OBS = fade_sync (when crossfade
+			 * START is visible) + dur/2 (half the fade). */
+			d->pending_sync_delay_ms = d->fade_sync_delay_ms +
+			                           dur_ms / 2;
+			/* Override the MOVE animation duration to 1ms so the
+			 * framing change is essentially instantaneous —
+			 * hidden inside the camera-fade midpoint. */
+			d->pending_move_duration_ms = 1;
 			snprintf(d->pending_scene, sizeof(d->pending_scene),
 			         "%s", g_active_scene_name);
 			blog(LOG_INFO,
 			     "[Shot Presets] FADE '%s' -> ATEM mix %d "
-			     "(%d frames / %dms); OBS cross-dissolve deferred "
-			     "by %d ms (fade_sync), scene='%s'",
+			     "(%d frames / %dms); 1ms MOVE deferred to "
+			     "midpoint (+%d ms = fade_sync %d + dur/2 %d), "
+			     "scene='%s'",
 			     bk->presets[index].name, atem, frames, dur_ms,
-			     d->fade_sync_delay_ms, g_active_scene_name);
+			     d->pending_sync_delay_ms, d->fade_sync_delay_ms,
+			     dur_ms / 2, g_active_scene_name);
 			return;
 		}
 
@@ -1346,6 +1361,7 @@ static void go_to_preset_internal(struct shot_presets_data *d, int index,
 				d->pending_transition_override = transition_override;
 				d->pending_elapsed = 0.0f;
 				d->pending_sync_delay_ms = eff_sync_delay;
+				d->pending_move_duration_ms = 0; /* no override */
 				snprintf(d->pending_scene, sizeof(d->pending_scene),
 				         "%s", g_active_scene_name);
 				blog(LOG_INFO,
@@ -1408,15 +1424,18 @@ static void go_to_preset_internal(struct shot_presets_data *d, int index,
 	int effective_transition = (transition_override >= 0)
 		? transition_override
 		: bk->presets[index].transition_type;
-	/* Use the OBS-side cross-dissolve effect ONLY for same-source fades
-	 * (no ATEM input set on this preset). When ATEM is set, the camera
-	 * change is handled by ATEM hardware mix; running the OBS cross-
-	 * dissolve simultaneously produces the visible "ghost overlap" of
-	 * two framing rectangles which the user sees as a third intermediate
-	 * state. Falling through to the MOVE animation path instead gives
-	 * a single-rectangle smooth zoom alongside the camera fade. */
-	bool is_fade = (effective_transition == SHOT_TRANSITION_FADE) &&
-	               (bk->presets[index].atem_input == 0);
+	bool is_fade = (effective_transition == SHOT_TRANSITION_FADE);
+	/* Cross-camera fade override: when this re-entry was deferred by
+	 * the FADE+ATEM-different path, pending_move_duration_ms is set.
+	 * That signals "we're at the camera-fade midpoint right now — do
+	 * a near-instant MOVE so the framing change is hidden inside the
+	 * busiest visible moment of the camera fade, not a cross-dissolve
+	 * (which would show ghost overlap)." Same-camera/no-ATEM fades
+	 * fall through to the normal cross-dissolve path unchanged. */
+	int forced_move_duration_ms = d->pending_move_duration_ms;
+	d->pending_move_duration_ms = 0; /* consume */
+	if (forced_move_duration_ms > 0)
+		is_fade = false;
 	/* Fade uses the dedicated fade default; move uses the move default.
 	 * Per-preset duration_ms overrides either when > 0. */
 	int default_dur = is_fade ? d->fade_duration_ms : d->duration_ms;
@@ -1425,6 +1444,9 @@ static void go_to_preset_internal(struct shot_presets_data *d, int index,
 		: default_dur;
 	if (d->active_duration_ms < 50)
 		d->active_duration_ms = is_fade ? 600 : 400;
+	/* Cross-camera fade midpoint snap: forced_move_duration_ms wins. */
+	if (forced_move_duration_ms > 0)
+		d->active_duration_ms = forced_move_duration_ms;
 	d->fade_enabled = false;
 	d->fade_t = 0.0f;
 
@@ -2309,8 +2331,11 @@ static void filter_tick(void *data, float seconds)
 
 	int dur_ms = d->active_duration_ms > 0 ? d->active_duration_ms
 	                                       : d->duration_ms;
-	if (dur_ms < 50)
-		dur_ms = 400;
+	/* Allow very short durations (cross-camera fade midpoint snap uses
+	 * 1ms to make the framing change effectively instantaneous behind
+	 * the ATEM crossfade). Only floor non-positive values. */
+	if (dur_ms < 1)
+		dur_ms = 1;
 	float duration_s = (float)dur_ms / 1000.0f;
 
 	float t = d->running_duration / duration_s;
