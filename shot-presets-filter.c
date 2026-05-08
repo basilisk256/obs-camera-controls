@@ -1293,48 +1293,13 @@ static void go_to_preset_internal(struct shot_presets_data *d, int index,
 		 * between the two framings of the same camera. */
 		bool atem_same_input = (atem >= 1) &&
 			(atem_get_last_program_input() == atem);
-		if (atem >= 1 && eff_t == SHOT_TRANSITION_FADE && !atem_same_input) {
-			/* FADE + ATEM input (different from current): the
-			 * ATEM hardware crossfade handles the camera change
-			 * smoothly. The OBS framing change is a near-instant
-			 * MOVE animation (~1 frame) timed to land at the
-			 * midpoint of the visible ATEM crossfade — when both
-			 * cameras are 50/50, the framing change is masked by
-			 * the busiest moment of the camera fade and is
-			 * effectively invisible. */
-			int dur_ms = bk->presets[index].duration_ms > 0
-				? bk->presets[index].duration_ms
-				: d->fade_duration_ms;
-			if (dur_ms < 50) dur_ms = 600;
-			int frames = (dur_ms + 16) / 33;
-			if (frames < 1) frames = 1;
-			atem_perform_mix_transition(atem, frames);
-
-			d->pending_kind = PENDING_GO;
-			d->pending_index = index;
-			d->pending_transition_override = transition_override;
-			d->pending_elapsed = 0.0f;
-			/* Defer until the visible midpoint of the ATEM
-			 * crossfade in OBS = fade_sync (when crossfade
-			 * START is visible) + dur/2 (half the fade). */
-			d->pending_sync_delay_ms = d->fade_sync_delay_ms +
-			                           dur_ms / 2;
-			/* Override the MOVE animation duration to 1ms so the
-			 * framing change is essentially instantaneous —
-			 * hidden inside the camera-fade midpoint. */
-			d->pending_move_duration_ms = 1;
-			snprintf(d->pending_scene, sizeof(d->pending_scene),
-			         "%s", g_active_scene_name);
-			blog(LOG_INFO,
-			     "[Shot Presets] FADE '%s' -> ATEM mix %d "
-			     "(%d frames / %dms); 1ms MOVE deferred to "
-			     "midpoint (+%d ms = fade_sync %d + dur/2 %d), "
-			     "scene='%s'",
-			     bk->presets[index].name, atem, frames, dur_ms,
-			     d->pending_sync_delay_ms, d->fade_sync_delay_ms,
-			     dur_ms / 2, g_active_scene_name);
-			return;
-		}
+		/* (Cross-camera FADE special path removed. The user found
+		 * every variant of "make framing change blend smoothly with
+		 * the ATEM camera fade" visually unacceptable, and decided
+		 * to just avoid pressing Fade across cameras. So FADE+ATEM-
+		 * different now falls through to the same hard-cut-on-ATEM +
+		 * cross-dissolve path that all FADE triggers used originally.
+		 * Same-camera fades still cross-dissolve normally.) */
 
 		/* Same-input fade: skip ATEM entirely and fall through to
 		 * the OBS-side cross-dissolve (which handles framing fades
@@ -1425,17 +1390,9 @@ static void go_to_preset_internal(struct shot_presets_data *d, int index,
 		? transition_override
 		: bk->presets[index].transition_type;
 	bool is_fade = (effective_transition == SHOT_TRANSITION_FADE);
-	/* Cross-camera fade override: when this re-entry was deferred by
-	 * the FADE+ATEM-different path, pending_move_duration_ms is set.
-	 * That signals "we're at the camera-fade midpoint right now — do
-	 * a near-instant MOVE so the framing change is hidden inside the
-	 * busiest visible moment of the camera fade, not a cross-dissolve
-	 * (which would show ghost overlap)." Same-camera/no-ATEM fades
-	 * fall through to the normal cross-dissolve path unchanged. */
-	int forced_move_duration_ms = d->pending_move_duration_ms;
-	d->pending_move_duration_ms = 0; /* consume */
-	if (forced_move_duration_ms > 0)
-		is_fade = false;
+	/* pending_move_duration_ms is no longer set anywhere; consume any
+	 * stale value defensively. */
+	d->pending_move_duration_ms = 0;
 	/* Fade uses the dedicated fade default; move uses the move default.
 	 * Per-preset duration_ms overrides either when > 0. */
 	int default_dur = is_fade ? d->fade_duration_ms : d->duration_ms;
@@ -1444,9 +1401,6 @@ static void go_to_preset_internal(struct shot_presets_data *d, int index,
 		: default_dur;
 	if (d->active_duration_ms < 50)
 		d->active_duration_ms = is_fade ? 600 : 400;
-	/* Cross-camera fade midpoint snap: forced_move_duration_ms wins. */
-	if (forced_move_duration_ms > 0)
-		d->active_duration_ms = forced_move_duration_ms;
 	d->fade_enabled = false;
 	d->fade_t = 0.0f;
 
