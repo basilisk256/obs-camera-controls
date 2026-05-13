@@ -1393,11 +1393,15 @@ static void go_to_preset_internal(struct shot_presets_data *d, int index,
 	/* pending_move_duration_ms is no longer set anywhere; consume any
 	 * stale value defensively. */
 	d->pending_move_duration_ms = 0;
-	/* Fade uses the dedicated fade default; move uses the move default.
-	 * Per-preset duration_ms overrides either when > 0. */
+	/* Fade uses the dedicated fade default; move/cut use the move default.
+	 * Per-preset duration_ms overrides move/cut only — fades always honor
+	 * the global Fade knob so it actually does something. (Otherwise a
+	 * preset with a per-preset duration set would silently pin its fade
+	 * duration and the global knob would appear broken.) */
 	int default_dur = is_fade ? d->fade_duration_ms : d->duration_ms;
-	d->active_duration_ms = bk->presets[index].duration_ms > 0
-		? bk->presets[index].duration_ms
+	int per_preset = bk->presets[index].duration_ms;
+	d->active_duration_ms = (!is_fade && per_preset > 0)
+		? per_preset
 		: default_dur;
 	if (d->active_duration_ms < 50)
 		d->active_duration_ms = is_fade ? 600 : 400;
@@ -1421,6 +1425,18 @@ static void go_to_preset_internal(struct shot_presets_data *d, int index,
 			uint32_t sh = parent ? obs_source_get_height(parent) : 0;
 
 			if (sw && sh && cw && ch) {
+				/* All three sceneitem writes below (capture
+				 * to-matrix, apply identity-fill, enable fade)
+				 * must look atomic to the render thread.
+				 * Otherwise the user sees intermediate frames:
+				 * a snap to `to` framing, then the raw source
+				 * at canvas origin (identity-fill with fade
+				 * still disabled), before the cross-dissolve
+				 * begins. obs_enter_graphics blocks the render
+				 * thread on the same graphics lock so the next
+				 * frame it renders sees the final state. */
+				obs_enter_graphics();
+
 				/* (1) box matrix for the current framing. */
 				obs_sceneitem_get_box_transform(item, &d->fade_from_mtx);
 
@@ -1449,6 +1465,8 @@ static void go_to_preset_internal(struct shot_presets_data *d, int index,
 				d->fade_src_h = sh;
 				d->fade_enabled = true;
 				d->fade_diag_frames = 0;
+
+				obs_leave_graphics();
 				blog(LOG_INFO,
 				     "[Shot Presets] fade START cw=%u ch=%u sw=%u sh=%u "
 				     "effect=%p texrender=%p from_mtx[0]=(%.2f,%.2f,%.2f,%.2f) "

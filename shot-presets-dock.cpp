@@ -83,9 +83,9 @@ void ShotPresetsDock::buildUI()
 	fadeDurationSpin->setSuffix(" ms");
 	fadeDurationSpin->setSingleStep(50);
 	fadeDurationSpin->setToolTip(
-		"Default fade duration (per-row Fade button + ATEM hardware "
-		"mix transition rate). Per-preset Duration in Edit panel "
-		"overrides this when set.");
+		"Fade duration (per-row Fade button + ATEM hardware "
+		"mix transition rate). Always applies to fades; per-preset "
+		"Duration only overrides Move/Cut.");
 	fadeDurationSpin->setValue(shot_presets_get_fade_duration());
 	connect(fadeDurationSpin, QOverload<int>::of(&QSpinBox::valueChanged),
 		this, &ShotPresetsDock::onFadeDurationChanged);
@@ -335,7 +335,9 @@ void ShotPresetsDock::refreshUI()
 			pDur->setSuffix(" ms");
 			pDur->setSingleStep(50);
 			pDur->setSpecialValueText("(use default)");
-			pDur->setToolTip("Per-preset duration. 0 = use the default above.");
+			pDur->setToolTip(
+				"Per-preset Move/Cut duration. 0 = use the global "
+				"Move default. Fades always use the global Fade knob.");
 			connect(pDur, QOverload<int>::of(&QSpinBox::valueChanged),
 				this, [this, i](int v) {
 					onPresetDurationChanged(i, v);
